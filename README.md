@@ -71,10 +71,10 @@ python -m pip install --user -r requirements.txt && python main.py
 
 每次正常讀取巴哈時，程式會接收回應中的 `Set-Cookie`。只有頁面已確認登入帳號正確、而且回應確實含 Cookie 更新時，才會合併並原子寫回 `data/cookies.json`；第一次寫回前另存 `data/cookies.json.backup`。因此網站若採用活動式續期，新的 Cookie 會被保留下來，而登出頁不能覆寫有效憑證。即將到期不會通知；只有標示期限已過、正常讀頁後仍未收到續期 Cookie，或登入實際失效時才會要求人工處理。
 
-上傳後先執行只讀檢查：
+啟動伺服器後，直接在 Pterodactyl Console 輸入只讀指令（不要加 `python main.py`）：
 
-```bash
-python main.py --check
+```text
+check
 ```
 
 成功時會看到 `"ok": true`、`"owner_verified": true`、`"reply_form": true`。這一步不發文、不刪文。
@@ -91,8 +91,8 @@ python main.py --help
 
 ### 2. 登入與解析檢查（唯讀）
 
-```bash
-python main.py --check
+```text
+check
 ```
 
 ### 3. 非伺服招生文章的完整往返測試
@@ -103,27 +103,29 @@ python main.py --check
 - 分類不是「伺服招生」（程式也會拒絕 `subbsn=18`）。
 - 不是正式自推目標文章。
 
-確認後執行：
+確認後在 Pterodactyl Console 輸入：
 
-```bash
-python main.py --live-test "https://forum.gamer.com.tw/C.php?bsn=18673&snA=你的測試文章" --confirm-live-test
+```text
+live-test https://forum.gamer.com.tw/C.php?bsn=18673&snA=你的測試文章 CONFIRM
 ```
 
 它會短暫公開一則帶時間戳的「自動化連線測試……」回覆，驗證後立即刪除。只有這項測試能端到端證明目前 Cookie、網站表單與刪文 token 都可用。若輸出未顯示 `"deleted": true`，立即開啟測試文章人工確認。
 
 ### 4. 正式單次執行
 
-```bash
-python main.py --once
+```text
+once
 ```
 
-這會真的對正式文章發文／刪除。無參數 `python main.py` 才會常駐等待每天 `20:30`。
+這會真的對正式文章發文／刪除。Startup 維持 `python main.py`，程式會一邊等待每天 `20:30`，一邊從 stdin 接收 Console 指令。
 
 查最近一次結果：
 
-```bash
-python main.py --status
+```text
+status
 ```
+
+其他 Console 指令：`next` 顯示下次排程、`help` 顯示完整說明、`stop` 安全停止。原有 `python main.py --check` 等參數仍可在一般 Shell 使用，但 Pterodactyl Console 不需要也不能這樣輸入。
 
 ## Discord 通知
 
@@ -131,8 +133,8 @@ python main.py --status
 
 測試通知：
 
-```bash
-python main.py --test-notification
+```text
+test-notification
 ```
 
 - 每日流程成功與完整往返測試成功：一般訊息，不標註使用者。

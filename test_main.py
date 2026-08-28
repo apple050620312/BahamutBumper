@@ -8,6 +8,8 @@ from main import (
     Post,
     build_session,
     classify_daily_posts,
+    console_help,
+    execute_console_command,
     load_cookie_records,
     parse_delete_request,
     parse_posted_at,
@@ -98,6 +100,11 @@ class MainTests(unittest.TestCase):
         end = start + timedelta(minutes=1)
         self.assertEqual(seconds_until(end, start), 60)
         self.assertEqual(seconds_until(start, end), 0)
+
+    def test_pterodactyl_console_commands(self):
+        self.assertIn("check", console_help())
+        self.assertFalse(execute_console_command("help", self.config()))
+        self.assertTrue(execute_console_command("stop", self.config()))
 
     def test_snapshot_parsing_and_owner_proof(self):
         snapshot = parse_thread_snapshot(

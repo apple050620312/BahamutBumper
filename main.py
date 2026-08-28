@@ -13,9 +13,12 @@ import html
 import json
 import logging
 import os
+import queue
 import re
+import shlex
 import signal
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1021,14 +1024,101 @@ def process_lock(path: Path) -> Iterator[None]:
         handle.close()
 
 
-def interruptible_sleep(stop: list[bool], seconds: float) -> None:
+def _console_reader(commands: queue.Queue[str]) -> None:
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return
+        command = line.strip()
+        if command:
+            commands.put(command)
+
+
+def console_help() -> str:
+    return (
+        "可用 Console 指令：\n"
+        "  check                  唯讀檢查登入、文章與 token\n"
+        "  once                   立即執行正式發文／刪文流程一次\n"
+        "  status                 顯示最近一次執行結果\n"
+        "  next                   顯示下次排程時間\n"
+        "  test-notification      發送不 @ 使用者的 Discord 測試通知\n"
+        "  live-test <URL> CONFIRM 在自己的非伺服招生文章測試發文後刪除\n"
+        "  help                   顯示本說明\n"
+        "  stop                   安全停止程式"
+    )
+
+
+def execute_console_command(line: str, config: Config) -> bool:
+    """Execute one stdin command. Return True when the daemon should stop."""
+    try:
+        parts = shlex.split(line)
+    except ValueError as exc:
+        LOG.error("Console 指令格式錯誤：%s", exc)
+        return False
+    if not parts:
+        return False
+    command = parts[0].casefold()
+    try:
+        if command == "help":
+            print(console_help(), flush=True)
+        elif command == "check":
+            print(json.dumps(run_check(config), ensure_ascii=False, indent=2), flush=True)
+        elif command == "once":
+            print(json.dumps(run_once(config), ensure_ascii=False, indent=2), flush=True)
+        elif command == "status":
+            print_status(config)
+        elif command == "next":
+            print(
+                f"下次排程：{next_scheduled_at(config, datetime.now(config.timezone)).isoformat()}",
+                flush=True,
+            )
+        elif command == "test-notification":
+            if _discord_webhook_url(config) is None:
+                raise ConfigurationError("尚未設定 Discord Webhook。")
+            if not send_discord_notification(
+                config,
+                "✅ Bahamut Bumper Discord Webhook 測試成功；一般成功通知不會標註你。",
+            ):
+                raise SafetyError("Discord 測試通知發送失敗。")
+            print("Discord 測試通知已送出。", flush=True)
+        elif command == "live-test":
+            if len(parts) != 3 or parts[2] != "CONFIRM":
+                raise ConfigurationError("用法：live-test <URL> CONFIRM")
+            print(
+                json.dumps(
+                    live_round_trip_test(config, parts[1]), ensure_ascii=False, indent=2
+                ),
+                flush=True,
+            )
+        elif command in {"stop", "quit", "exit"}:
+            LOG.info("收到 Console stop 指令，將安全停止。")
+            return True
+        else:
+            LOG.error("未知 Console 指令：%s。輸入 help 查看可用指令。", parts[0])
+    except (ConfigurationError, AuthenticationError, SafetyError, ValueError) as exc:
+        if command in {"once", "live-test"}:
+            notify_failure(config, exc, scope="Console 手動執行")
+        LOG.error("Console 指令 %s 失敗：%s", command, exc)
+    return False
+
+
+def wait_with_console(
+    stop: list[bool], commands: queue.Queue[str], seconds: float, config: Config
+) -> None:
     deadline = time.monotonic() + seconds
     while not stop[0] and time.monotonic() < deadline:
-        time.sleep(min(30.0, max(0.0, deadline - time.monotonic())))
+        timeout = min(1.0, max(0.0, deadline - time.monotonic()))
+        try:
+            command = commands.get(timeout=timeout)
+        except queue.Empty:
+            continue
+        if execute_console_command(command, config):
+            stop[0] = True
 
 
 def run_daemon(config: Config) -> None:
     stop = [False]
+    commands: queue.Queue[str] = queue.Queue()
 
     def request_stop(signum: int, _frame: Any) -> None:
         LOG.info("收到訊號 %s，將安全停止。", signum)
@@ -1036,13 +1126,25 @@ def run_daemon(config: Config) -> None:
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
+    threading.Thread(
+        target=_console_reader,
+        args=(commands,),
+        name="pterodactyl-console",
+        daemon=True,
+    ).start()
+    LOG.info("Console 互動指令已啟用；輸入 help 查看說明。")
     now = datetime.now(config.timezone)
     run_now = config.run_missed_on_start and now.time() >= config.bump_at
     while not stop[0]:
         if not run_now:
             target = next_scheduled_at(config, datetime.now(config.timezone))
             LOG.info("下次執行：%s", target.isoformat())
-            interruptible_sleep(stop, seconds_until(target, datetime.now(config.timezone)))
+            wait_with_console(
+                stop,
+                commands,
+                seconds_until(target, datetime.now(config.timezone)),
+                config,
+            )
             if stop[0]:
                 break
         run_now = False
@@ -1071,7 +1173,7 @@ def run_daemon(config: Config) -> None:
                 if final_failure:
                     notify_failure(config, exc, scope="每日流程")
                     break
-                interruptible_sleep(stop, config.retry_minutes * 60)
+                wait_with_console(stop, commands, config.retry_minutes * 60, config)
                 if stop[0]:
                     break
 
