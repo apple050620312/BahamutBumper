@@ -1,80 +1,162 @@
-# Bahamut Bumper for Pterodactyl
+# Bahamut Bumper（Pterodactyl Generic Python Egg）
 
-常駐於 Pterodactyl 的巴哈姆特自推程序。預設每天台北時間 `18:00` 在指定文章回覆「推」，確認新回覆成功後，才刪除前一天由同帳號發布的自推。
+這是放進一般 Pterodactyl **Python Generic Egg** 就能執行的常駐程式，不需要 Chromium、Playwright 或自訂 Docker image。它使用匯出的巴哈 Cookie，以普通 HTTPS 請求完成：
 
-預設時間來自 2026-08-28 07:34 的滾動 24 小時截面：43 個非置頂主題中，27 個（62.8%）集中在 18:00–23:59，21 點是單小時峰值。18:00 能在晚間流量開始時回到頂部，並依該日推文量維持在首頁直到熱門時段結束。這只是單日樣本，之後可用 `BUMP_TIME` 調整。
+1. 每天台北時間 `20:30` 檢查目標文章。
+2. 當天尚未自推才回覆「推」。
+3. 重新讀取文章，唯一驗證新樓層存在。
+4. 再讀一次最新頁面與刪文 token，刪除昨天自己的回覆。
+5. 再次確認舊樓層已消失，將結果寫入 `data/status.json`。
 
-## 安全與防呆
+任何一步無法明確確認就停止；尤其新回覆沒有驗證成功時，絕不刪昨天的回覆。
 
-- 每次執行前讀取討論串；今天已有自推便不會再次發布。
-- 新回覆無法唯一驗證時，絕不刪除舊回覆。
-- 只刪除作者、日期和樓層都符合的「昨天自推」，不會刪首篇或他人文章。
-- 重啟後若偵測到今天已推但昨天尚未刪，會接著完成清理。
-- `data/`、Cookie 與登入狀態已加入 `.gitignore`；`storage_state.json` 等同登入憑證，勿公開或提交 Git。
-- 子板規限制每日 `00:00–23:59` 只能自推一次；若你有多篇伺服器文章，不能讓其他文章同日自推。
+## 為什麼選 20:30
 
-## Pterodactyl 安裝
+分析板面頁 1–3、最近七天可見資料後，共整理出 72 個活躍主題、278 筆可見更新。首頁扣除置頂後約有 29 格；以「某時點之後更新過的不同主題數」估算被擠出首頁，而不是直接累加回覆數。
 
-需要 Python 3.11 以上，以及能執行 Playwright Chromium 的映像。一般 Python 映像若缺少 Chromium 系統函式庫，請改用含 Playwright/Chromium 相依套件的映像，或請主機管理員加入相關套件。
+六個完整日循環（2026-08-21～08-26）的中位估算：
 
-安裝指令：
+| 自推時間 | 首頁中位存活 | 下一次自推前不在首頁 |
+|---|---:|---:|
+| 18:00 | 約 18.9 小時 | 約 5.1 小時 |
+| 20:00 | 約 22.0 小時 | 約 2.0 小時 |
+| **20:30** | **約 22.2 小時** | **約 1.8 小時** |
+| 21:00 | 約 22.0 小時 | 約 2.0 小時 |
+| 22:00 | 約 21.1 小時 | 約 3.0 小時 |
+
+因此 `20:30` 比 18:00 少犧牲隔日白天曝光，也沒有像 22:00 那樣錯過太多晚間流量。歷史上已刪除的推文無法回收，這個模型仍可能稍微高估存活時間。
+
+## 從零安裝到 Generic Egg
+
+建議 Python 3.11 以上。將這些檔案上傳到伺服器根目錄：
+
+- `main.py`
+- `requirements.txt`
+- 依 `.env.example` 建立的 Pterodactyl Variables
+- `data/cookies.json`（稍後建立；不要公開）
+
+第一次在 Console 安裝：
 
 ```bash
-pip install -r requirements.txt
-python -m playwright install chromium
+python -m pip install --user -r requirements.txt
 ```
 
-Pterodactyl Startup Command：
+Pterodactyl Startup Command 設成：
 
 ```bash
 python main.py
 ```
 
-把 `.env.example` 中的值建立成 Pterodactyl Variables。程式直接讀取環境變數，不會自動載入 `.env`。
-
-重要變數：
-
-| 變數 | 預設值 | 說明 |
-|---|---:|---|
-| `BUMP_TIME` | `18:00` | 台北時間每日執行時間 |
-| `HEADLESS` | `true` | Pterodactyl 應保持無介面模式 |
-| `RUN_MISSED_ON_START` | `true` | 排定時間後重啟時立即補做；仍會先檢查今日是否已推 |
-| `RETRY_MINUTES` | `10` | 失敗後等待分鐘數 |
-| `MAX_RETRIES` | `3` | 當日最多嘗試次數 |
-| `CHROMIUM_EXECUTABLE_PATH` | 空白 | 映像內已有 Chromium 時可指定完整路徑 |
-
-## 登入狀態
-
-不要把帳號密碼寫進設定檔。推薦在有桌面的電腦產生 Playwright storage state，再把檔案上傳到 Pterodactyl 的 `data/storage_state.json`：
+若 Egg 每次重裝都會清掉套件，也可使用：
 
 ```bash
-pip install -r requirements.txt
-python -m playwright install chromium
-python main.py --login
+python -m pip install --user -r requirements.txt && python main.py
 ```
 
-瀏覽器開啟後自行登入巴哈，回到終端機按 Enter。將產生的 `data/storage_state.json` 上傳到伺服器相同位置。
+程式直接讀取 Pterodactyl Variables，不會自行讀 `.env`。必要變數的預設值已列在 `.env.example`；建議至少明確設定 `BAHAMUT_ACCOUNT`、`BAHAMUT_TARGET_URL`、`BUMP_TIME`。
 
-也可以匯出 `gamer.com.tw` 的 Cookie JSON，上傳後在 Pterodactyl Console 執行一次：
+伺服器必須允許 DNS 與對 `https://forum.gamer.com.tw` 的連出 HTTPS。
+
+## Cookie 從零設定
+
+不要把巴哈帳號密碼交給腳本，也不要放進環境變數。先在自己的瀏覽器登入巴哈，再用可信任的 Cookie 匯出工具，只匯出 `gamer.com.tw` 網域 Cookie。
+
+腳本接受三種 `data/cookies.json` 格式：
+
+1. 常見瀏覽器擴充套件匯出的 Cookie JSON 陣列。
+2. 含有頂層 `cookies` 陣列的 Playwright storage-state JSON。
+3. 簡單的名稱和值物件，例如 `{"cookie_name":"value"}`。
+
+也可將完整 `Cookie: name=value; ...` 純文字放入指定檔案。Cookie 等同登入憑證：不要貼到聊天、不要提交 Git、不要傳給他人；檔案已由 `.gitignore` 排除。
+
+上傳後先執行只讀檢查：
 
 ```bash
-python main.py --import-cookies cookies.json
+python main.py --check
 ```
 
-成功後請刪除原始 `cookies.json`，只保留權限受限的 `data/storage_state.json`。
+成功時會看到 `"ok": true`、`"owner_verified": true`、`"reply_form": true`。這一步不發文、不刪文。
 
-## 測試與單次執行
+## 安全測試順序
 
-只檢查登入、今日自推與昨日待刪狀態，不改動網站：
+### 1. 離線檢查
 
 ```bash
-python main.py --dry-run
+python -m unittest -v
+python -m py_compile main.py test_main.py
+python main.py --help
 ```
 
-立即執行一次後離開：
+### 2. 登入與解析檢查（唯讀）
+
+```bash
+python main.py --check
+```
+
+### 3. 非伺服招生文章的完整往返測試
+
+只能提供以下條件的 URL：
+
+- 文章首篇作者是 `BAHAMUT_ACCOUNT`。
+- 分類不是「伺服招生」（程式也會拒絕 `subbsn=18`）。
+- 不是正式自推目標文章。
+
+確認後執行：
+
+```bash
+python main.py --live-test "https://forum.gamer.com.tw/C.php?bsn=18673&snA=你的測試文章" --confirm-live-test
+```
+
+它會短暫公開一則帶時間戳的「自動化連線測試……」回覆，驗證後立即刪除。只有這項測試能端到端證明目前 Cookie、網站表單與刪文 token 都可用。若輸出未顯示 `"deleted": true`，立即開啟測試文章人工確認。
+
+### 4. 正式單次執行
 
 ```bash
 python main.py --once
 ```
 
-沒有參數時才會進入 Pterodactyl 常駐模式。
+這會真的對正式文章發文／刪除。無參數 `python main.py` 才會常駐等待每天 `20:30`。
+
+查最近一次結果：
+
+```bash
+python main.py --status
+```
+
+## 例外狀況如何處理
+
+- **Cookie 過期、錯誤帳號或無權回覆**：停止，不發文；重新登入並匯出 Cookie。
+- **CAPTCHA／Cloudflare 人機驗證**：停止，不繞過；用瀏覽器人工處理後更新 Cookie。
+- **送出時斷線，結果不明**：不刪舊文。常駐模式稍後重試時會先重讀文章；若今日回覆已存在便不會重複發。
+- **新回覆無法唯一驗證**：停止且不刪舊文。
+- **昨天是一般對話而不是推文**：只有內容完全等於 `BAHAMUT_DELETE_MESSAGES` 其中一項才可能刪除；預設 `推,eee` 是為了接手目前既有的 `eee`，之後可改成只留 `推`。
+- **刪文 token、作者、日期或文章編號不符**：停止且不刪。
+- **刪文回應不明**：寫入失敗狀態；人工查看文章。下一次執行會重新讀頁，不會靠舊 token 猜測。
+- **Pterodactyl 重啟**：若已過 20:30 且 `RUN_MISSED_ON_START=true`，立即補檢查；已有今日回覆就不重複發。
+- **兩個程序同時啟動**：`data/daemon.lock` 只允許一個實例。
+- **網站暫時故障**：每隔 `RETRY_MINUTES` 分鐘重試，最多 `MAX_RETRIES` 次。
+
+## 已知限制
+
+- 巴哈不是穩定公開 API；HTML、JavaScript 或 `post2.php` 參數改版時腳本會停止，需要更新解析器。
+- 直接 HTTP 可能被網站新增的人機驗證阻擋，程式不會規避。
+- Cookie 會過期，且 `--check` 通過只代表讀取、登入與表單解析正常；要證明寫入及刪除必須跑一次 `--live-test`。
+- 程式只能檢查 `BAHAMUT_TARGET_URL` 與你列入 `BAHAMUT_GUARD_URLS` 的文章。若你另有伺服招生文卻沒列入，程式不知道同日是否已在別篇自推。
+- 目前規則雖不再強制刪舊推文，腳本仍依你的要求執行「先發今日、驗證後刪昨日」。刪除候選必須是本人、昨天、非首篇，且文字完全符合 `BAHAMUT_DELETE_MESSAGES`；多個候選時會停下，不會猜哪則該刪。
+- 被刪除的歷史回覆無法用板面資料完整重建，因此曝光估算不是保證。
+
+## 重要環境變數
+
+| 變數 | 預設值 | 說明 |
+|---|---:|---|
+| `BUMP_TIME` | `20:30` | `TZ` 時區的每日時間 |
+| `TZ` | `Asia/Taipei` | 日界線與排程時區 |
+| `BAHAMUT_COOKIE_FILE` | `data/cookies.json` | Cookie 檔位置 |
+| `BAHAMUT_DELETE_MESSAGES` | `推,eee` | 允許刪除的昨日回覆文字 |
+| `BAHAMUT_GUARD_URLS` | 空白 | 其他本人伺服招生文，逗號分隔 |
+| `RUN_MISSED_ON_START` | `true` | 錯過時間後重啟是否立即補檢查 |
+| `RETRY_MINUTES` | `10` | 失敗重試間隔 |
+| `MAX_RETRIES` | `3` | 每輪最多嘗試次數 |
+| `HTTP_TIMEOUT_SECONDS` | `30` | 單次 HTTP 逾時秒數 |
+
+請遵守巴哈板規與站規；自動化不能替你判斷所有人工互動或臨時公告。

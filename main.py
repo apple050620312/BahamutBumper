@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Pterodactyl-friendly Bahamut daily self-bump daemon.
+"""Generic-Python Pterodactyl daemon for a daily Bahamut self-bump.
 
-The process sleeps until the configured Asia/Taipei wall-clock time, then uses
-Playwright with an uploaded storage-state file.  Every operation is idempotent:
-an existing self-reply from today prevents another reply, and yesterday's
-self-reply is deleted only after today's reply is visible.
+The program uses ordinary HTTPS requests and an exported cookie file.  It
+publishes at most one reply per calendar day, verifies the new reply, and only
+then removes the previous day's reply.  Ambiguous states fail closed.
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import os
@@ -20,17 +20,27 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time as wall_time, timedelta
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 
 LOG = logging.getLogger("bahamut-bumper")
 DEFAULT_URL = "https://forum.gamer.com.tw/C.php?bsn=18673&snA=205415"
-FULL_TIMESTAMP = re.compile(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})(?::\d{2})?")
+FORUM_HOST = "forum.gamer.com.tw"
+FULL_TIMESTAMP = re.compile(
+    r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})(?::(\d{2}))?"
+)
 RELATIVE_TIMESTAMP = re.compile(r"(今天|昨天)\s+(\d{2}:\d{2})")
-FLOOR_PATTERN = re.compile(r"^\s*(\d+)\s*樓\s*$")
+POST_ID_PATTERN = re.compile(r"(\d+)$")
+PDEL_PATTERN = re.compile(
+    r"function\s+pdel\s*\(\s*sn\s*\)\s*\{.*?"
+    r"var\s+args\s*=\s*'([^']*)'\s*\+\s*sn\s*\+\s*'([^']*)'\s*;.*?"
+    r"delPost\s*\(\s*sn\s*,\s*args\s*,\s*'([^']+)'\s*\)",
+    re.DOTALL,
+)
 
 
 class ConfigurationError(RuntimeError):
@@ -38,11 +48,11 @@ class ConfigurationError(RuntimeError):
 
 
 class AuthenticationError(RuntimeError):
-    """The saved Bahamut login is absent or expired."""
+    """The exported Bahamut login is absent, expired, or is the wrong user."""
 
 
 class SafetyError(RuntimeError):
-    """A page state was ambiguous, so no destructive action was taken."""
+    """Page state is ambiguous, so a write operation must not continue."""
 
 
 @dataclass(frozen=True)
@@ -50,22 +60,22 @@ class Config:
     target_url: str
     account: str
     message: str
+    deletable_messages: tuple[str, ...]
     bump_at: wall_time
     timezone: ZoneInfo
-    state_file: Path
+    cookie_file: Path
     data_dir: Path
-    headless: bool
-    browser_name: str
-    executable_path: str | None
+    guard_urls: tuple[str, ...]
     retry_minutes: int
     max_retries: int
     run_missed_on_start: bool
+    timeout_seconds: int
 
     @classmethod
-    def from_env(cls, *, force_headed: bool = False) -> "Config":
+    def from_env(cls) -> "Config":
         data_dir = Path(os.getenv("DATA_DIR", "data")).expanduser().resolve()
-        state_file = Path(
-            os.getenv("BAHAMUT_STORAGE_STATE", str(data_dir / "storage_state.json"))
+        cookie_file = Path(
+            os.getenv("BAHAMUT_COOKIE_FILE", str(data_dir / "cookies.json"))
         ).expanduser().resolve()
         timezone_name = os.getenv("TZ", "Asia/Taipei")
         try:
@@ -73,20 +83,44 @@ class Config:
         except Exception as exc:
             raise ConfigurationError(f"無效時區：{timezone_name}") from exc
 
+        target_url = validate_forum_url(
+            os.getenv("BAHAMUT_TARGET_URL", DEFAULT_URL).strip()
+        )
+        guards: list[str] = []
+        for value in os.getenv("BAHAMUT_GUARD_URLS", "").split(","):
+            if value.strip():
+                guard = validate_forum_url(value.strip())
+                if thread_identity(guard) != thread_identity(target_url):
+                    guards.append(guard)
+
+        account = os.getenv("BAHAMUT_ACCOUNT", "sangege01").strip()
+        message = os.getenv("BAHAMUT_MESSAGE", "推").strip()
+        if not account:
+            raise ConfigurationError("BAHAMUT_ACCOUNT 不可為空白。")
+        if not message:
+            raise ConfigurationError("BAHAMUT_MESSAGE 不可為空白。")
+        deletable_messages = tuple(
+            dict.fromkeys(
+                item.strip()
+                for item in os.getenv("BAHAMUT_DELETE_MESSAGES", f"{message},eee").split(",")
+                if item.strip()
+            )
+        )
+
         return cls(
-            target_url=os.getenv("BAHAMUT_TARGET_URL", DEFAULT_URL).strip(),
-            account=os.getenv("BAHAMUT_ACCOUNT", "sangege01").strip(),
-            message=os.getenv("BAHAMUT_MESSAGE", "推"),
-            bump_at=parse_wall_time(os.getenv("BUMP_TIME", "18:00")),
+            target_url=target_url,
+            account=account,
+            message=message,
+            deletable_messages=deletable_messages,
+            bump_at=parse_wall_time(os.getenv("BUMP_TIME", "20:30")),
             timezone=timezone,
-            state_file=state_file,
+            cookie_file=cookie_file,
             data_dir=data_dir,
-            headless=False if force_headed else env_bool("HEADLESS", True),
-            browser_name=os.getenv("PLAYWRIGHT_BROWSER", "chromium").strip().lower(),
-            executable_path=os.getenv("CHROMIUM_EXECUTABLE_PATH") or None,
+            guard_urls=tuple(dict.fromkeys(guards)),
             retry_minutes=max(1, int(os.getenv("RETRY_MINUTES", "10"))),
             max_retries=max(1, int(os.getenv("MAX_RETRIES", "3"))),
             run_missed_on_start=env_bool("RUN_MISSED_ON_START", True),
+            timeout_seconds=max(5, int(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))),
         )
 
 
@@ -97,6 +131,24 @@ class Post:
     author: str
     posted_at: datetime
     content: str
+
+
+@dataclass(frozen=True)
+class ThreadSnapshot:
+    url: str
+    html_text: str
+    posts: tuple[Post, ...]
+    form_action: str | None
+    form_fields: dict[str, str]
+    subboard: str | None
+    owner_verified: bool
+
+
+@dataclass(frozen=True)
+class DeleteRequest:
+    url: str
+    cookie_value: str
+    fields: dict[str, str]
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -110,8 +162,30 @@ def parse_wall_time(value: str) -> wall_time:
     try:
         parsed = datetime.strptime(value.strip(), "%H:%M")
     except ValueError as exc:
-        raise ConfigurationError("BUMP_TIME 必須使用 HH:MM，例如 18:00") from exc
+        raise ConfigurationError("BUMP_TIME 必須使用 HH:MM，例如 20:30") from exc
     return parsed.time()
+
+
+def validate_forum_url(url: str) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if (
+        parts.scheme != "https"
+        or parts.hostname != FORUM_HOST
+        or not parts.path.endswith("/C.php")
+        or not query.get("bsn", "").isdigit()
+        or not query.get("snA", "").isdigit()
+    ):
+        raise ConfigurationError(
+            "文章網址必須是 https://forum.gamer.com.tw/C.php 且包含數字 bsn、snA。"
+        )
+    clean_query = {"bsn": query["bsn"], "snA": query["snA"]}
+    return urlunsplit(("https", FORUM_HOST, "/C.php", urlencode(clean_query), ""))
+
+
+def thread_identity(url: str) -> tuple[str, str]:
+    query = dict(parse_qsl(urlsplit(url).query))
+    return query["bsn"], query["snA"]
 
 
 def with_last_page(url: str) -> str:
@@ -124,10 +198,10 @@ def with_last_page(url: str) -> str:
 def parse_posted_at(text: str, today: date, timezone: ZoneInfo) -> datetime | None:
     full = FULL_TIMESTAMP.search(text)
     if full:
+        seconds = full.group(3) or "00"
         return datetime.strptime(
-            f"{full.group(1)} {full.group(2)}", "%Y-%m-%d %H:%M"
+            f"{full.group(1)} {full.group(2)}:{seconds}", "%Y-%m-%d %H:%M:%S"
         ).replace(tzinfo=timezone)
-
     relative = RELATIVE_TIMESTAMP.search(text)
     if not relative:
         return None
@@ -147,278 +221,480 @@ def next_scheduled_at(config: Config, now: datetime) -> datetime:
     return candidate
 
 
-def import_playwright() -> Any:
+def import_http_dependencies() -> tuple[Any, Any]:
     try:
-        from playwright.sync_api import sync_playwright
+        import requests
+        from bs4 import BeautifulSoup
     except ImportError as exc:
         raise ConfigurationError(
-            "尚未安裝 Playwright；請先執行 pip install -r requirements.txt"
+            "缺少套件；請先執行 python -m pip install --user -r requirements.txt"
         ) from exc
-    return sync_playwright
+    return requests, BeautifulSoup
 
 
-def launch_browser(playwright: Any, config: Config) -> tuple[Any, Any]:
-    browser_type = getattr(playwright, config.browser_name, None)
-    if browser_type is None:
-        raise ConfigurationError(
-            "PLAYWRIGHT_BROWSER 僅接受 chromium、firefox 或 webkit"
+def _cookie_records(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict) and isinstance(payload.get("cookies"), list):
+        return payload["cookies"]
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        return [{"name": key, "value": value} for key, value in payload.items()]
+    raise ConfigurationError("Cookie JSON 格式不支援。")
+
+
+def load_cookie_records(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        raise AuthenticationError(
+            f"找不到 Cookie 檔：{path}；請依 README 匯出後上傳。"
         )
-    launch_args: dict[str, Any] = {"headless": config.headless}
-    if config.executable_path:
-        launch_args["executable_path"] = config.executable_path
+    raw = path.read_text(encoding="utf-8-sig").strip()
+    if not raw:
+        raise AuthenticationError(f"Cookie 檔是空的：{path}")
     try:
-        browser = browser_type.launch(**launch_args)
-    except Exception as exc:
-        raise ConfigurationError(
-            "無法啟動瀏覽器。Pterodactyl 映像需包含 Chromium 相依套件，"
-            "並先執行 python -m playwright install chromium。"
-        ) from exc
-
-    context_args: dict[str, Any] = {
-        "locale": "zh-TW",
-        "timezone_id": str(config.timezone),
-    }
-    if config.state_file.exists():
-        context_args["storage_state"] = str(config.state_file)
-    context = browser.new_context(**context_args)
-    return browser, context
-
-
-def save_state(context: Any, config: Config) -> None:
-    config.state_file.parent.mkdir(parents=True, exist_ok=True)
-    context.storage_state(path=str(config.state_file))
-    if os.name != "nt":
-        config.state_file.chmod(0o600)
+        return _cookie_records(json.loads(raw))
+    except json.JSONDecodeError:
+        cookie = SimpleCookie()
+        try:
+            cookie.load(raw.removeprefix("Cookie:").strip())
+        except Exception as exc:
+            raise ConfigurationError("Cookie 檔既不是 JSON，也不是 Cookie header。") from exc
+        records = [
+            {"name": name, "value": morsel.value, "domain": ".gamer.com.tw"}
+            for name, morsel in cookie.items()
+        ]
+        if not records:
+            raise ConfigurationError("Cookie header 中沒有可解析的 Cookie。")
+        return records
 
 
-def logged_in(page: Any) -> bool:
-    login_links = page.locator('a[href*="user.gamer.com.tw/login.php"]')
-    home_links = page.locator('a[href*="home.gamer.com.tw/homeindex.php"]')
-    return login_links.count() == 0 and home_links.count() > 0
-
-
-def read_posts(page: Any, config: Config, now: datetime) -> list[Post]:
-    raw_posts = page.locator('section.c-section[id^="post_"]').evaluate_all(
-        """
-        sections => sections.map(section => {
-          const links = Array.from(section.querySelectorAll('a'));
-          const floorLink = links.find(a => /^\\s*\\d+\\s*樓\\s*$/.test(a.textContent || ''));
-          if (!floorLink) return null;
-          const authorLink = links.find(a => /home\\.gamer\\.com\\.tw\\//.test(a.href || ''));
-          const article = section.querySelector('article');
-          return {
-            post_id: section.id,
-            floor_text: floorLink.textContent || '',
-            author_href: authorLink ? authorLink.href : '',
-            text: section.innerText || '',
-            content: article ? article.innerText.trim() : ''
-          };
-        }).filter(Boolean)
-        """
+def build_session(config: Config) -> Any:
+    requests, _ = import_http_dependencies()
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+            ),
+            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
+            "Cache-Control": "no-cache",
+        }
     )
+    for record in load_cookie_records(config.cookie_file):
+        name = str(record.get("name", "")).strip()
+        value = str(record.get("value", ""))
+        if not name:
+            continue
+        domain = str(record.get("domain") or ".gamer.com.tw")
+        path = str(record.get("path") or "/")
+        session.cookies.set(name, value, domain=domain, path=path)
+    if not session.cookies:
+        raise AuthenticationError("Cookie 檔沒有任何有效 Cookie。")
+    return session
+
+
+def request_page(session: Any, url: str, config: Config) -> tuple[str, str]:
+    try:
+        response = session.get(url, timeout=config.timeout_seconds, allow_redirects=True)
+        response.raise_for_status()
+    except Exception as exc:
+        raise SafetyError(f"讀取巴哈頁面失敗：{exc}") from exc
+    ensure_no_challenge(response.text, response.url)
+    return response.text, response.url
+
+
+def ensure_no_challenge(text: str, final_url: str = "") -> None:
+    lower = text.casefold()
+    markers = (
+        "captcha",
+        "cf-chl-",
+        "cloudflare ray id",
+        "驗證碼",
+        "確認您不是機器人",
+    )
+    if any(marker.casefold() in lower for marker in markers):
+        raise SafetyError("網站要求 CAPTCHA/人機驗證；腳本不會嘗試繞過。")
+    if "login.php" in final_url:
+        raise AuthenticationError("Cookie 已失效，網站把請求導向登入頁。")
+
+
+def _post_author(section: Any) -> str:
+    author_link = section.select_one("a.userid")
+    if author_link:
+        return author_link.get_text(" ", strip=True)
+    for link in section.select('a[href*="home.gamer.com.tw"]'):
+        href = link.get("href", "").rstrip("/")
+        if href:
+            return href.rsplit("/", 1)[-1]
+    return ""
+
+
+def _owner_metadata(soup: Any, account: str) -> dict[str, Any] | None:
+    first_post = None
+    for section in soup.select('section.c-section[id^="post_"]'):
+        floor = section.select_one("a.floor[data-floor]") or section.select_one("a.floor")
+        if floor and re.search(
+            r"\b1\b", str(floor.get("data-floor") or floor.get_text(" ", strip=True))
+        ):
+            first_post = section
+            break
+    if first_post is None:
+        return None
+    for element in first_post.select(".tippy-option-menu[data-tippy]"):
+        raw = html.unescape(element.get("data-tippy", ""))
+        try:
+            data = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            str(data.get("author", "")).casefold() == account.casefold()
+            and data.get("owner") is True
+        ):
+            return data
+    return None
+
+
+def parse_thread_snapshot(
+    page_text: str, url: str, account: str, now: datetime
+) -> ThreadSnapshot:
+    _, BeautifulSoup = import_http_dependencies()
+    soup = BeautifulSoup(page_text, "html.parser")
     posts: list[Post] = []
-    for raw in raw_posts:
-        floor_match = FLOOR_PATTERN.match(raw["floor_text"])
-        posted_at = parse_posted_at(raw["text"], now.date(), config.timezone)
+    for section in soup.select('section.c-section[id^="post_"]'):
+        id_match = POST_ID_PATTERN.search(str(section.get("id", "")))
+        floor_link = section.select_one("a.floor[data-floor]") or section.select_one(
+            "a.floor"
+        )
+        time_node = section.select_one(".edittime[data-mtime]") or section.select_one(
+            ".edittime"
+        )
+        if not id_match or not floor_link or not time_node:
+            continue
+        floor_text = str(floor_link.get("data-floor") or floor_link.get_text(" ", strip=True))
+        floor_match = re.search(r"\d+", floor_text)
+        timestamp_text = str(time_node.get("data-mtime") or time_node.get_text(" ", strip=True))
+        posted_at = parse_posted_at(timestamp_text, now.date(), now.tzinfo)
         if not floor_match or posted_at is None:
             continue
-        author = raw["author_href"].rstrip("/").rsplit("/", 1)[-1]
+        article = section.select_one("article")
         posts.append(
             Post(
-                post_id=raw["post_id"],
-                floor=int(floor_match.group(1)),
-                author=author,
+                post_id=id_match.group(1),
+                floor=int(floor_match.group()),
+                author=_post_author(section),
                 posted_at=posted_at,
-                content=raw["content"],
+                content=article.get_text("\n", strip=True) if article else "",
             )
         )
-    return posts
+
+    form = soup.select_one('form[name="frm"]')
+    fields: dict[str, str] = {}
+    form_action: str | None = None
+    if form:
+        form_action = urljoin(url, str(form.get("action") or "post2.php"))
+        for node in form.select("input[name]"):
+            fields[str(node.get("name"))] = str(node.get("value") or "")
+
+    owner_metadata = _owner_metadata(soup, account)
+    metadata_subboard = None
+    if owner_metadata and owner_metadata.get("subbsn") is not None:
+        metadata_subboard = str(owner_metadata["subbsn"])
+    subboard = fields.get("threadSubbsn") or fields.get("subbsn") or metadata_subboard
+    if not subboard:
+        match = re.search(r"threadSubbsn=(\d+)", page_text)
+        subboard = match.group(1) if match else None
+
+    return ThreadSnapshot(
+        url=url,
+        html_text=page_text,
+        posts=tuple(posts),
+        form_action=form_action,
+        form_fields=fields,
+        subboard=subboard,
+        owner_verified=owner_metadata is not None,
+    )
 
 
-def own_posts(posts: list[Post], account: str) -> list[Post]:
-    return [post for post in posts if post.author.casefold() == account.casefold()]
+def fetch_snapshot(session: Any, url: str, config: Config) -> ThreadSnapshot:
+    page_text, final_url = request_page(session, with_last_page(url), config)
+    snapshot = parse_thread_snapshot(page_text, final_url, config.account, datetime.now(config.timezone))
+    if not snapshot.posts:
+        raise SafetyError("頁面中找不到任何可解析樓層；可能是頁面結構已變更。")
+    return snapshot
 
 
-def ensure_no_captcha(page: Any) -> None:
-    body_text = page.locator("body").inner_text()
-    if "驗證碼" in body_text or "CAPTCHA" in body_text.upper():
-        raise SafetyError("網站要求驗證碼，腳本不會嘗試繞過；請人工處理後再啟動。")
+def assert_owner_login(snapshot: ThreadSnapshot, config: Config) -> None:
+    if not snapshot.owner_verified:
+        raise AuthenticationError(
+            f"無法證明目前 Cookie 是文章作者 {config.account}；可能已登出、帳號錯誤或頁面改版。"
+        )
+    if not snapshot.form_action or "post2.php" not in snapshot.form_action:
+        raise AuthenticationError("找不到快速回覆表單；Cookie 可能失效或帳號不能回覆。")
 
 
-def post_reply(page: Any, config: Config) -> None:
-    ensure_no_captcha(page)
-    editor_body = page.frame_locator("iframe#editor").locator("body")
-    editor_body.wait_for(state="visible", timeout=15_000)
-    editor_body.fill(config.message)
-    submit = page.get_by_role("button", name="送出", exact=True).last
-    if not submit.is_enabled():
-        raise SafetyError("送出按鈕不可用，未送出任何內容。")
-    submit.click()
-    page.wait_for_timeout(2_000)
+def own_posts(snapshot: ThreadSnapshot, account: str) -> list[Post]:
+    return [
+        post
+        for post in snapshot.posts
+        if post.floor > 1 and post.author.casefold() == account.casefold()
+    ]
 
 
-def delete_post(page: Any, post: Post, account: str) -> None:
-    if post.floor <= 1 or post.author.casefold() != account.casefold():
-        raise SafetyError("拒絕刪除：目標不是自己的樓層回覆。")
-    section = page.locator(f"#{post.post_id}")
-    if section.count() != 1:
-        raise SafetyError("拒絕刪除：無法唯一定位昨天的回覆。")
-
-    menu = section.get_by_role("button", name="", exact=True)
-    menu.click()
-    delete_link = page.get_by_role("link", name="刪除文章", exact=True).last
-    delete_link.wait_for(state="visible", timeout=5_000)
-    page.once("dialog", lambda dialog: dialog.accept())
-    delete_link.click()
-    page.wait_for_timeout(2_000)
-
-
-def refresh_last_page(page: Any, config: Config) -> None:
-    page.goto(with_last_page(config.target_url), wait_until="domcontentloaded", timeout=30_000)
-    page.wait_for_timeout(800)
+def post_reply(session: Any, snapshot: ThreadSnapshot, message: str, config: Config) -> None:
+    if not snapshot.form_action:
+        raise SafetyError("找不到回覆端點，未送出內容。")
+    fields = dict(snapshot.form_fields)
+    fields["rtecontent"] = message
+    try:
+        response = session.post(
+            snapshot.form_action,
+            data=fields,
+            headers={"Referer": snapshot.url, "Origin": "https://forum.gamer.com.tw"},
+            timeout=config.timeout_seconds,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        raise SafetyError(f"送出回覆時發生網路錯誤：{exc}；將重新讀頁確認，不會刪舊文。") from exc
+    ensure_no_challenge(response.text, response.url)
 
 
-def run_once(config: Config, *, dry_run: bool = False) -> None:
-    sync_playwright = import_playwright()
-    with sync_playwright() as playwright:
-        browser, context = launch_browser(playwright, config)
-        try:
-            page = context.new_page()
-            refresh_last_page(page, config)
-            if not logged_in(page):
-                raise AuthenticationError(
-                    f"{config.account} 的登入狀態不存在或已過期；請重新產生 storage_state.json。"
-                )
-            ensure_no_captcha(page)
-
-            now = datetime.now(config.timezone)
-            posts = own_posts(read_posts(page, config, now), config.account)
-            today_posts = [post for post in posts if post.posted_at.date() == now.date()]
-            yesterday = now.date() - timedelta(days=1)
-            yesterday_posts = [post for post in posts if post.posted_at.date() == yesterday]
-
-            if len(today_posts) > 1:
-                raise SafetyError("偵測到今天已有多則自推；停止操作並請人工檢查。")
-            if len(yesterday_posts) > 1:
-                raise SafetyError("偵測到昨天有多則未刪自推；為避免刪錯，停止操作。")
-
-            old_post = yesterday_posts[0] if yesterday_posts else None
-            if dry_run:
-                LOG.info(
-                    "DRY RUN：今日自推=%d；昨日待刪=%s；不會送出或刪除。",
-                    len(today_posts),
-                    f"{old_post.floor} 樓 {old_post.post_id}" if old_post else "無",
-                )
-                return
-
-            if not today_posts:
-                before_ids = {post.post_id for post in posts}
-                LOG.info("今日尚未自推，準備發布：%r", config.message)
-                post_reply(page, config)
-                refresh_last_page(page, config)
-                verified_now = datetime.now(config.timezone)
-                verified_posts = own_posts(read_posts(page, config, verified_now), config.account)
-                new_today = [
-                    post
-                    for post in verified_posts
-                    if post.posted_at.date() == verified_now.date()
-                    and post.post_id not in before_ids
-                    and post.content.strip() == config.message.strip()
-                ]
-                if len(new_today) != 1:
-                    raise SafetyError("無法唯一驗證今日新回覆；保留所有舊內容。")
-                LOG.info("發布成功：%d 樓（%s）", new_today[0].floor, new_today[0].post_id)
-                save_state(context, config)
-            else:
-                LOG.info("今天已有自推（%d 樓），不重複發布。", today_posts[0].floor)
-
-            if old_post is None:
-                LOG.info("找不到昨天的自推，無需刪除。")
-                save_state(context, config)
-                return
-
-            refresh_last_page(page, config)
-            active_ids = {post.post_id for post in read_posts(page, config, datetime.now(config.timezone))}
-            if old_post.post_id not in active_ids:
-                LOG.info("昨天的自推已不存在，無需再次刪除。")
-                save_state(context, config)
-                return
-
-            LOG.info("今日自推已確認，準備刪除昨天的 %d 樓。", old_post.floor)
-            delete_post(page, old_post, config.account)
-            refresh_last_page(page, config)
-            remaining_ids = {
-                post.post_id for post in read_posts(page, config, datetime.now(config.timezone))
-            }
-            if old_post.post_id in remaining_ids:
-                raise SafetyError("刪除後仍偵測到昨天的回覆，請人工檢查。")
-            LOG.info("已刪除昨天的 %d 樓；今日流程完成。", old_post.floor)
-            save_state(context, config)
-        finally:
-            context.close()
-            browser.close()
+def parse_delete_request(snapshot: ThreadSnapshot, post: Post) -> DeleteRequest:
+    match = PDEL_PATTERN.search(snapshot.html_text)
+    if not match:
+        raise SafetyError("找不到刪文 token；網站腳本可能已改版。")
+    raw_query = html.unescape(f"{match.group(1)}{post.post_id}{match.group(2)}")
+    fields = dict(parse_qsl(raw_query, keep_blank_values=True))
+    expected_bsn, expected_sna = thread_identity(snapshot.url)
+    required = {"bsn", "sn", "type", "code", "pwd", "snA"}
+    if not required.issubset(fields):
+        raise SafetyError("刪文參數不完整，拒絕刪除。")
+    if (
+        fields["bsn"] != expected_bsn
+        or fields["snA"] != expected_sna
+        or fields["sn"] != post.post_id
+        or fields["type"] != "4"
+        or not fields["code"]
+        or not fields["pwd"]
+        or not match.group(3)
+    ):
+        raise SafetyError("刪文參數與目標樓層不一致，拒絕刪除。")
+    delete_url = urljoin(snapshot.url, f"post2.php?{urlencode(fields)}")
+    return DeleteRequest(delete_url, match.group(3), fields)
 
 
-def normalize_cookie(cookie: dict[str, Any]) -> dict[str, Any]:
-    result = dict(cookie)
-    if "expirationDate" in result and "expires" not in result:
-        result["expires"] = result.pop("expirationDate")
-    result.pop("hostOnly", None)
-    result.pop("session", None)
-    result.pop("storeId", None)
-    same_site = result.get("sameSite")
-    if isinstance(same_site, str):
-        mapping = {"no_restriction": "None", "unspecified": "Lax"}
-        result["sameSite"] = mapping.get(same_site.lower(), same_site.capitalize())
-    allowed = {
-        "name", "value", "url", "domain", "path", "expires",
-        "httpOnly", "secure", "sameSite",
+def delete_post(
+    session: Any, snapshot: ThreadSnapshot, post: Post, config: Config
+) -> None:
+    if post.floor <= 1 or post.author.casefold() != config.account.casefold():
+        raise SafetyError("拒絕刪除：目標不是自己的回覆樓層。")
+    current = next((item for item in snapshot.posts if item.post_id == post.post_id), None)
+    if current != post:
+        raise SafetyError("拒絕刪除：重新讀頁後，目標日期、作者或內容已不一致。")
+    delete_request = parse_delete_request(snapshot, post)
+    session.cookies.set(
+        "ckFORUM_pdel", delete_request.cookie_value, domain=".gamer.com.tw", path="/"
+    )
+    try:
+        response = session.get(
+            delete_request.url,
+            headers={"Referer": snapshot.url},
+            timeout=config.timeout_seconds,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        raise SafetyError(f"刪文請求失敗：{exc}；請人工確認網站狀態。") from exc
+    ensure_no_challenge(response.text, response.url)
+
+
+def classify_daily_posts(
+    snapshot: ThreadSnapshot, config: Config, now: datetime
+) -> tuple[list[Post], list[Post]]:
+    posts = own_posts(snapshot, config.account)
+    today_posts = [post for post in posts if post.posted_at.date() == now.date()]
+    yesterday = now.date() - timedelta(days=1)
+    yesterday_posts = [
+        post
+        for post in posts
+        if post.posted_at.date() == yesterday
+        and post.content.strip() in config.deletable_messages
+    ]
+    if len(today_posts) > 1:
+        raise SafetyError("偵測到今天已有多則自己的回覆；停止並請人工檢查。")
+    if len(yesterday_posts) > 1:
+        raise SafetyError("偵測到昨天有多則符合刪除文字的回覆；為避免刪錯，停止操作。")
+    return today_posts, yesterday_posts
+
+
+def check_guard_threads(session: Any, config: Config, today: date) -> None:
+    for url in config.guard_urls:
+        snapshot = fetch_snapshot(session, url, config)
+        guarded_today = [
+            post
+            for post in own_posts(snapshot, config.account)
+            if post.posted_at.date() == today
+        ]
+        if guarded_today:
+            raise SafetyError(
+                f"同帳號今天已在另一篇受監控文章回覆：{url}；依板規不再自推。"
+            )
+
+
+def verify_new_post(
+    snapshot: ThreadSnapshot,
+    config: Config,
+    before_ids: set[str],
+    today: date,
+    expected_message: str,
+) -> Post:
+    candidates = [
+        post
+        for post in own_posts(snapshot, config.account)
+        if post.posted_at.date() == today
+        and post.post_id not in before_ids
+        and post.content.strip() == expected_message.strip()
+    ]
+    if len(candidates) != 1:
+        raise SafetyError("無法唯一驗證新回覆；保留所有舊內容並停止。")
+    return candidates[0]
+
+
+def run_check(config: Config) -> dict[str, Any]:
+    session = build_session(config)
+    snapshot = fetch_snapshot(session, config.target_url, config)
+    assert_owner_login(snapshot, config)
+    now = datetime.now(config.timezone)
+    today_posts, yesterday_posts = classify_daily_posts(snapshot, config, now)
+    return {
+        "ok": True,
+        "checked_at": now.isoformat(),
+        "target": config.target_url,
+        "account": config.account,
+        "owner_verified": snapshot.owner_verified,
+        "subboard": snapshot.subboard,
+        "parsed_posts": len(snapshot.posts),
+        "today_own_replies": [asdict_post(post) for post in today_posts],
+        "yesterday_own_replies": [asdict_post(post) for post in yesterday_posts],
+        "reply_form": bool(snapshot.form_action),
+        "delete_token": bool(PDEL_PATTERN.search(snapshot.html_text)),
+        "guard_urls": list(config.guard_urls),
     }
-    return {key: value for key, value in result.items() if key in allowed}
 
 
-def import_cookies(config: Config, cookie_file: Path) -> None:
-    payload = json.loads(cookie_file.read_text(encoding="utf-8"))
-    if isinstance(payload, dict) and "cookies" in payload:
-        cookies = payload["cookies"]
-    elif isinstance(payload, list):
-        cookies = payload
+def run_once(config: Config) -> dict[str, Any]:
+    session = build_session(config)
+    snapshot = fetch_snapshot(session, config.target_url, config)
+    assert_owner_login(snapshot, config)
+    now = datetime.now(config.timezone)
+    today_posts, yesterday_posts = classify_daily_posts(snapshot, config, now)
+    old_post = yesterday_posts[0] if yesterday_posts else None
+
+    if not today_posts:
+        check_guard_threads(session, config, now.date())
+        before_ids = {post.post_id for post in snapshot.posts}
+        LOG.info("今日尚未自推，準備發布：%r", config.message)
+        post_reply(session, snapshot, config.message, config)
+        verified = fetch_snapshot(session, config.target_url, config)
+        assert_owner_login(verified, config)
+        new_post = verify_new_post(
+            verified, config, before_ids, datetime.now(config.timezone).date(), config.message
+        )
+        LOG.info("發布並驗證成功：%d 樓（%s）", new_post.floor, new_post.post_id)
     else:
-        raise ConfigurationError("Cookie JSON 必須是陣列，或含有 cookies 陣列的物件。")
-    normalized = [normalize_cookie(cookie) for cookie in cookies]
-    sync_playwright = import_playwright()
-    with sync_playwright() as playwright:
-        browser, context = launch_browser(playwright, config)
-        try:
-            context.add_cookies(normalized)
-            page = context.new_page()
-            refresh_last_page(page, config)
-            if not logged_in(page):
-                raise AuthenticationError("匯入 Cookie 後仍未登入，請重新匯出完整 gamer.com.tw Cookie。")
-            save_state(context, config)
-            LOG.info("Cookie 已匯入，並驗證登入成功。")
-        finally:
-            context.close()
-            browser.close()
+        new_post = today_posts[0]
+        LOG.info("今天已有自己的回覆（%d 樓），不重複發布。", new_post.floor)
+
+    if old_post is not None:
+        fresh = fetch_snapshot(session, config.target_url, config)
+        fresh_today, _ = classify_daily_posts(fresh, config, datetime.now(config.timezone))
+        if len(fresh_today) != 1:
+            raise SafetyError("刪文前無法確認今天恰有一則自己的回覆；不刪舊文。")
+        LOG.info("準備刪除昨天的 %d 樓（%s）。", old_post.floor, old_post.post_id)
+        delete_post(session, fresh, old_post, config)
+        after_delete = fetch_snapshot(session, config.target_url, config)
+        if any(post.post_id == old_post.post_id for post in after_delete.posts):
+            raise SafetyError("刪文後舊樓層仍存在；請人工檢查。")
+        LOG.info("已驗證昨天的 %d 樓刪除成功。", old_post.floor)
+    else:
+        LOG.info("找不到昨天自己的回覆，無需刪除。")
+
+    result = {
+        "ok": True,
+        "completed_at": datetime.now(config.timezone).isoformat(),
+        "new_post": asdict_post(new_post),
+        "deleted_post": asdict_post(old_post) if old_post else None,
+    }
+    write_status(config, result)
+    return result
 
 
-def interactive_login(config: Config) -> None:
-    sync_playwright = import_playwright()
-    with sync_playwright() as playwright:
-        browser, context = launch_browser(playwright, config)
-        try:
-            page = context.new_page()
-            page.goto(config.target_url, wait_until="domcontentloaded", timeout=30_000)
-            print("請在開啟的瀏覽器登入巴哈姆特；完成後回到終端機按 Enter。")
-            input()
-            refresh_last_page(page, config)
-            if not logged_in(page):
-                raise AuthenticationError("目前仍未登入，未寫入登入狀態。")
-            save_state(context, config)
-            LOG.info("登入狀態已儲存至 %s", config.state_file)
-        finally:
-            context.close()
-            browser.close()
+def live_round_trip_test(config: Config, test_url: str) -> dict[str, Any]:
+    test_url = validate_forum_url(test_url)
+    if thread_identity(test_url) == thread_identity(config.target_url):
+        raise SafetyError("即時測試禁止使用正式自推文章。")
+    session = build_session(config)
+    snapshot = fetch_snapshot(session, test_url, config)
+    assert_owner_login(snapshot, config)
+    if snapshot.subboard is None:
+        raise SafetyError("無法辨識測試文章分類；拒絕發文。")
+    if snapshot.subboard == "18":
+        raise SafetyError("即時測試禁止在「伺服招生」（subbsn=18）分類執行。")
+
+    unique = datetime.now(config.timezone).strftime("%Y%m%d-%H%M%S")
+    message = f"自動化連線測試 {unique}，驗證後將立即刪除。"
+    before_ids = {post.post_id for post in snapshot.posts}
+    LOG.warning("即時測試將公開回覆：%s", message)
+    post_reply(session, snapshot, message, config)
+    verified = fetch_snapshot(session, test_url, config)
+    test_post = verify_new_post(
+        verified, config, before_ids, datetime.now(config.timezone).date(), message
+    )
+    fresh = fetch_snapshot(session, test_url, config)
+    delete_post(session, fresh, test_post, config)
+    after = fetch_snapshot(session, test_url, config)
+    if any(post.post_id == test_post.post_id for post in after.posts):
+        raise SafetyError("測試回覆未能驗證刪除；請立即人工處理。")
+    result = {
+        "ok": True,
+        "tested_at": datetime.now(config.timezone).isoformat(),
+        "test_url": test_url,
+        "message": message,
+        "post_id": test_post.post_id,
+        "deleted": True,
+    }
+    write_status(config, result)
+    return result
+
+
+def asdict_post(post: Post | None) -> dict[str, Any] | None:
+    if post is None:
+        return None
+    return {
+        "post_id": post.post_id,
+        "floor": post.floor,
+        "author": post.author,
+        "posted_at": post.posted_at.isoformat(),
+        "content": post.content,
+    }
+
+
+def write_status(config: Config, payload: dict[str, Any]) -> None:
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    destination = config.data_dir / "status.json"
+    temporary = config.data_dir / "status.json.tmp"
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(destination)
+
+
+def print_status(config: Config) -> None:
+    path = config.data_dir / "status.json"
+    if not path.is_file():
+        print("尚無執行紀錄。")
+        return
+    print(path.read_text(encoding="utf-8"))
 
 
 @contextmanager
@@ -473,7 +749,6 @@ def run_daemon(config: Config) -> None:
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-
     now = datetime.now(config.timezone)
     run_now = config.run_missed_on_start and now.time() >= config.bump_at
     while not stop[0]:
@@ -484,7 +759,6 @@ def run_daemon(config: Config) -> None:
             if stop[0]:
                 break
         run_now = False
-
         run_date = datetime.now(config.timezone).date()
         for attempt in range(1, config.max_retries + 1):
             try:
@@ -492,6 +766,14 @@ def run_daemon(config: Config) -> None:
                 run_once(config)
                 break
             except Exception as exc:
+                failure = {
+                    "ok": False,
+                    "failed_at": datetime.now(config.timezone).isoformat(),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "attempt": attempt,
+                }
+                write_status(config, failure)
                 LOG.exception("每日流程失敗：%s", exc)
                 if attempt >= config.max_retries or datetime.now(config.timezone).date() != run_date:
                     break
@@ -501,12 +783,17 @@ def run_daemon(config: Config) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="巴哈姆特每日自推與昨日回覆清理")
+    parser = argparse.ArgumentParser(description="巴哈每日自推（Generic Python Egg）")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--once", action="store_true", help="立即執行一次後離開")
-    mode.add_argument("--dry-run", action="store_true", help="只檢查，不送出或刪除")
-    mode.add_argument("--login", action="store_true", help="開啟有介面的瀏覽器並儲存登入狀態")
-    mode.add_argument("--import-cookies", type=Path, metavar="FILE", help="匯入 Cookie JSON")
+    mode.add_argument("--once", action="store_true", help="立即執行正式流程一次")
+    mode.add_argument("--check", action="store_true", help="只讀檢查登入、文章與 token")
+    mode.add_argument("--status", action="store_true", help="顯示最近一次執行紀錄")
+    mode.add_argument("--live-test", metavar="URL", help="在自己的非伺服招生文章測試發文後刪除")
+    parser.add_argument(
+        "--confirm-live-test",
+        action="store_true",
+        help="確認接受測試回覆會短暫公開（搭配 --live-test）",
+    )
     return parser
 
 
@@ -517,21 +804,32 @@ def main() -> int:
     )
     args = build_parser().parse_args()
     try:
-        config = Config.from_env(force_headed=args.login)
+        config = Config.from_env()
         config.data_dir.mkdir(parents=True, exist_ok=True)
+        if args.status:
+            print_status(config)
+            return 0
         with process_lock(config.data_dir / "daemon.lock"):
-            if args.login:
-                interactive_login(config)
-            elif args.import_cookies:
-                import_cookies(config, args.import_cookies.expanduser().resolve())
-            elif args.dry_run:
-                run_once(config, dry_run=True)
+            if args.check:
+                print(json.dumps(run_check(config), ensure_ascii=False, indent=2))
+            elif args.live_test:
+                if not args.confirm_live_test:
+                    raise ConfigurationError(
+                        "即時測試會公開發文；確認網址無誤後加上 --confirm-live-test。"
+                    )
+                print(
+                    json.dumps(
+                        live_round_trip_test(config, args.live_test),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
             elif args.once:
-                run_once(config)
+                print(json.dumps(run_once(config), ensure_ascii=False, indent=2))
             else:
                 run_daemon(config)
         return 0
-    except (ConfigurationError, AuthenticationError, SafetyError) as exc:
+    except (ConfigurationError, AuthenticationError, SafetyError, ValueError) as exc:
         LOG.error("%s", exc)
         return 2
     except KeyboardInterrupt:
