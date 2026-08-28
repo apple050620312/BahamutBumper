@@ -69,6 +69,8 @@ python -m pip install --user -r requirements.txt && python main.py
 
 也可將完整 `Cookie: name=value; ...` 純文字放入指定檔案。Cookie 等同登入憑證：不要貼到聊天、不要提交 Git、不要傳給他人；檔案已由 `.gitignore` 排除。
 
+每次正常讀取巴哈時，程式會接收回應中的 `Set-Cookie`，合併後原子寫回 `data/cookies.json`，因此網站若採用活動式續期，新的 Cookie 會被保留下來。即將到期不會通知；只有標示期限已過、正常讀頁後仍未收到續期 Cookie，或登入實際失效時才會要求人工處理。
+
 上傳後先執行只讀檢查：
 
 ```bash
@@ -123,9 +125,25 @@ python main.py --once
 python main.py --status
 ```
 
+## Discord 通知
+
+將 Webhook URL 單獨放在 `data/discord_webhook.txt`；此檔位於已被 Git 忽略的 `data/`，不要把網址寫進程式或提交版本庫。也可以改用 Pterodactyl 的秘密環境變數 `DISCORD_WEBHOOK_URL`。
+
+測試通知：
+
+```bash
+python main.py --test-notification
+```
+
+- 每日流程成功與完整往返測試成功：一般訊息，不標註使用者。
+- Cookie 已過期且讀頁後仍未續期、登入失效、CAPTCHA 或每日流程最終失敗：標註 `DISCORD_ATTENTION_USER_ID`。
+- 同一事件會寫入 `data/notification_state.json` 去重，避免重啟或重試反覆洗頻。
+- `allowed_mentions` 明確限制為指定使用者，不允許訊息內容觸發 `@everyone` 或其他標註。
+
 ## 例外狀況如何處理
 
 - **Cookie 過期、錯誤帳號或無權回覆**：停止，不發文；重新登入並匯出 Cookie。
+- **網站主動續期 Cookie**：自動保存到原 Cookie 檔，不需人工處理。
 - **CAPTCHA／Cloudflare 人機驗證**：停止，不繞過；用瀏覽器人工處理後更新 Cookie。
 - **送出時斷線，結果不明**：不刪舊文。常駐模式稍後重試時會先重讀文章；若今日回覆已存在便不會重複發。
 - **新回覆無法唯一驗證**：停止且不刪舊文。
@@ -158,5 +176,7 @@ python main.py --status
 | `RETRY_MINUTES` | `10` | 失敗重試間隔 |
 | `MAX_RETRIES` | `3` | 每輪最多嘗試次數 |
 | `HTTP_TIMEOUT_SECONDS` | `30` | 單次 HTTP 逾時秒數 |
+| `DISCORD_WEBHOOK_FILE` | `data/discord_webhook.txt` | Webhook 密鑰檔位置 |
+| `DISCORD_ATTENTION_USER_ID` | `523114942434639873` | 只有需人工處理時才標註的使用者 |
 
 請遵守巴哈板規與站規；自動化不能替你判斷所有人工互動或臨時公告。

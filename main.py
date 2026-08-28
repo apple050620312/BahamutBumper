@@ -70,6 +70,8 @@ class Config:
     max_retries: int
     run_missed_on_start: bool
     timeout_seconds: int
+    discord_webhook_file: Path
+    discord_user_id: str
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -99,6 +101,11 @@ class Config:
             raise ConfigurationError("BAHAMUT_ACCOUNT 不可為空白。")
         if not message:
             raise ConfigurationError("BAHAMUT_MESSAGE 不可為空白。")
+        discord_user_id = os.getenv(
+            "DISCORD_ATTENTION_USER_ID", "523114942434639873"
+        ).strip()
+        if not discord_user_id.isdigit():
+            raise ConfigurationError("DISCORD_ATTENTION_USER_ID 必須是純數字。")
         deletable_messages = tuple(
             dict.fromkeys(
                 item.strip()
@@ -121,6 +128,12 @@ class Config:
             max_retries=max(1, int(os.getenv("MAX_RETRIES", "3"))),
             run_missed_on_start=env_bool("RUN_MISSED_ON_START", True),
             timeout_seconds=max(5, int(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))),
+            discord_webhook_file=Path(
+                os.getenv(
+                    "DISCORD_WEBHOOK_FILE", str(data_dir / "discord_webhook.txt")
+                )
+            ).expanduser().resolve(),
+            discord_user_id=discord_user_id,
         )
 
 
@@ -287,10 +300,57 @@ def build_session(config: Config) -> Any:
             continue
         domain = str(record.get("domain") or ".gamer.com.tw")
         path = str(record.get("path") or "/")
-        session.cookies.set(name, value, domain=domain, path=path)
+        expires = record.get("expirationDate", record.get("expires"))
+        try:
+            expires = int(float(expires)) if expires not in (None, "", 0, -1) else None
+        except (TypeError, ValueError):
+            expires = None
+        session.cookies.set(
+            name,
+            value,
+            domain=domain,
+            path=path,
+            expires=expires,
+            secure=bool(record.get("secure", False)),
+        )
     if not session.cookies:
         raise AuthenticationError("Cookie 檔沒有任何有效 Cookie。")
     return session
+
+
+def persist_session_cookies(session: Any, config: Config) -> None:
+    """Atomically preserve any Set-Cookie rotations received from Bahamut."""
+    records = []
+    for cookie in session.cookies:
+        if cookie.name == "ckFORUM_pdel":
+            continue
+        records.append(
+            {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain or ".gamer.com.tw",
+                "path": cookie.path or "/",
+                "expires": cookie.expires,
+                "secure": bool(cookie.secure),
+            }
+        )
+    if not records:
+        return
+    config.cookie_file.parent.mkdir(parents=True, exist_ok=True)
+    temporary = config.cookie_file.with_suffix(config.cookie_file.suffix + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(config.cookie_file)
+        if os.name != "nt":
+            config.cookie_file.chmod(0o600)
+    except OSError as exc:
+        LOG.warning("無法保存網站更新後的 Cookie：%s", exc)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def request_page(session: Any, url: str, config: Config) -> tuple[str, str]:
@@ -300,6 +360,7 @@ def request_page(session: Any, url: str, config: Config) -> tuple[str, str]:
     except Exception as exc:
         raise SafetyError(f"讀取巴哈頁面失敗：{exc}") from exc
     ensure_no_challenge(response.text, response.url)
+    persist_session_cookies(session, config)
     return response.text, response.url
 
 
@@ -564,6 +625,7 @@ def run_check(config: Config) -> dict[str, Any]:
     session = build_session(config)
     snapshot = fetch_snapshot(session, config.target_url, config)
     assert_owner_login(snapshot, config)
+    notify_cookie_expiry(config)
     now = datetime.now(config.timezone)
     today_posts, yesterday_posts = classify_daily_posts(snapshot, config, now)
     return {
@@ -586,11 +648,13 @@ def run_once(config: Config) -> dict[str, Any]:
     session = build_session(config)
     snapshot = fetch_snapshot(session, config.target_url, config)
     assert_owner_login(snapshot, config)
+    notify_cookie_expiry(config)
     now = datetime.now(config.timezone)
     today_posts, yesterday_posts = classify_daily_posts(snapshot, config, now)
     old_post = yesterday_posts[0] if yesterday_posts else None
 
     if not today_posts:
+        posted_new = True
         check_guard_threads(session, config, now.date())
         before_ids = {post.post_id for post in snapshot.posts}
         LOG.info("今日尚未自推，準備發布：%r", config.message)
@@ -602,6 +666,7 @@ def run_once(config: Config) -> dict[str, Any]:
         )
         LOG.info("發布並驗證成功：%d 樓（%s）", new_post.floor, new_post.post_id)
     else:
+        posted_new = False
         new_post = today_posts[0]
         LOG.info("今天已有自己的回覆（%d 樓），不重複發布。", new_post.floor)
 
@@ -622,10 +687,12 @@ def run_once(config: Config) -> dict[str, Any]:
     result = {
         "ok": True,
         "completed_at": datetime.now(config.timezone).isoformat(),
+        "posted_new": posted_new,
         "new_post": asdict_post(new_post),
         "deleted_post": asdict_post(old_post) if old_post else None,
     }
     write_status(config, result)
+    notify_daily_success(config, result)
     return result
 
 
@@ -664,6 +731,11 @@ def live_round_trip_test(config: Config, test_url: str) -> dict[str, Any]:
         "deleted": True,
     }
     write_status(config, result)
+    send_discord_notification(
+        config,
+        f"✅ 巴哈非伺服招生文章的發文／刪文往返測試成功。\n{test_url}",
+        dedupe_key=f"live-test-{test_post.post_id}",
+    )
     return result
 
 
@@ -677,6 +749,172 @@ def asdict_post(post: Post | None) -> dict[str, Any] | None:
         "posted_at": post.posted_at.isoformat(),
         "content": post.content,
     }
+
+
+def _discord_webhook_url(config: Config) -> str | None:
+    value = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    if not value and config.discord_webhook_file.is_file():
+        value = config.discord_webhook_file.read_text(encoding="utf-8-sig").strip()
+    if not value:
+        return None
+    parts = urlsplit(value)
+    if (
+        parts.scheme != "https"
+        or parts.hostname != "discord.com"
+        or not re.fullmatch(r"/api(?:/v\d+)?/webhooks/\d+/[^/]+", parts.path)
+    ):
+        raise ConfigurationError("Discord Webhook URL 格式無效。")
+    return value
+
+
+def _notification_state(config: Config) -> set[str]:
+    path = config.data_dir / "notification_state.json"
+    if not path.is_file():
+        return set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return {str(item) for item in payload.get("sent", [])}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return set()
+
+
+def _save_notification_state(config: Config, sent: set[str]) -> None:
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    path = config.data_dir / "notification_state.json"
+    temporary = config.data_dir / "notification_state.json.tmp"
+    try:
+        temporary.write_text(
+            json.dumps({"sent": sorted(sent)[-200:]}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    except OSError as exc:
+        LOG.warning("無法保存 Discord 通知去重狀態：%s", exc)
+
+
+def send_discord_notification(
+    config: Config,
+    message: str,
+    *,
+    attention: bool = False,
+    dedupe_key: str | None = None,
+) -> bool:
+    """Send a Discord webhook without ever logging its secret URL."""
+    try:
+        webhook_url = _discord_webhook_url(config)
+    except (OSError, ConfigurationError) as exc:
+        LOG.warning("Discord Webhook 設定無法使用：%s", exc)
+        return False
+    if webhook_url is None:
+        return False
+    sent = _notification_state(config)
+    if dedupe_key and dedupe_key in sent:
+        return True
+    if attention:
+        content = f"<@{config.discord_user_id}> {message}"
+        allowed_mentions = {"users": [config.discord_user_id]}
+    else:
+        content = message
+        allowed_mentions = {"parse": []}
+    requests, _ = import_http_dependencies()
+    try:
+        response = requests.post(
+            webhook_url,
+            params={"wait": "true"},
+            json={
+                "content": content[:2000],
+                "allowed_mentions": allowed_mentions,
+                "username": "Bahamut Bumper",
+            },
+            timeout=config.timeout_seconds,
+        )
+        if response.status_code not in {200, 204}:
+            LOG.warning("Discord 通知失敗（HTTP %d）。", response.status_code)
+            return False
+    except Exception as exc:
+        LOG.warning("Discord 通知連線失敗（%s）。", type(exc).__name__)
+        return False
+    if dedupe_key:
+        sent.add(dedupe_key)
+        _save_notification_state(config, sent)
+    return True
+
+
+def auth_cookie_expiry(config: Config) -> datetime | None:
+    critical_names = {
+        "BAHAENUR",
+        "BAHAHASHID",
+        "BAHAID",
+        "BAHARUNE",
+        "MB_BAHAID",
+        "MB_BAHARUNE",
+    }
+    expirations: list[float] = []
+    for record in load_cookie_records(config.cookie_file):
+        if str(record.get("name", "")) not in critical_names:
+            continue
+        raw = record.get("expirationDate", record.get("expires"))
+        try:
+            if raw not in (None, "", 0, -1):
+                expirations.append(float(raw))
+        except (TypeError, ValueError):
+            continue
+    if not expirations:
+        return None
+    return datetime.fromtimestamp(min(expirations), config.timezone)
+
+
+def notify_cookie_expiry(config: Config) -> None:
+    try:
+        expiry = auth_cookie_expiry(config)
+    except (ConfigurationError, AuthenticationError):
+        return
+    if expiry is None:
+        return
+    now = datetime.now(config.timezone)
+    remaining = expiry - now
+    if remaining.total_seconds() > 0:
+        return
+    expiry_text = expiry.strftime("%Y-%m-%d %H:%M:%S %Z")
+    expiry_key = str(int(expiry.timestamp()))
+    message = (
+        f"⚠️ 巴哈主要登入 Cookie 的標示期限已過（{expiry_text}），"
+        "而正常讀頁後仍未收到續期 Cookie。請重新登入並匯出 data/cookies.json。"
+    )
+    send_discord_notification(
+        config,
+        message,
+        attention=True,
+        dedupe_key=f"cookie-expired-{expiry_key}",
+    )
+
+
+def notify_daily_success(config: Config, result: dict[str, Any]) -> None:
+    date_key = datetime.now(config.timezone).date().isoformat()
+    new_post = result.get("new_post") or {}
+    deleted = result.get("deleted_post")
+    action = "已發布新回覆" if result.get("posted_new") else "今日回覆已存在，未重複發布"
+    cleanup = (
+        f"；已刪除昨日 {deleted.get('floor')} 樓"
+        if isinstance(deleted, dict)
+        else "；昨日無待刪推文"
+    )
+    send_discord_notification(
+        config,
+        f"✅ 巴哈每日流程完成：{action}（{new_post.get('floor', '?')} 樓）{cleanup}\n{config.target_url}",
+        dedupe_key=f"daily-success-{date_key}",
+    )
+
+
+def notify_failure(config: Config, exc: Exception, *, scope: str) -> None:
+    date_key = datetime.now(config.timezone).date().isoformat()
+    detail = str(exc).replace("`", "'")[:800]
+    send_discord_notification(
+        config,
+        f"❌ 巴哈自推需要處理：{scope}失敗（{type(exc).__name__}）\n{detail}\n{config.target_url}",
+        attention=True,
+        dedupe_key=f"failure-{scope}-{date_key}-{type(exc).__name__}",
+    )
 
 
 def write_status(config: Config, payload: dict[str, Any]) -> None:
@@ -775,7 +1013,12 @@ def run_daemon(config: Config) -> None:
                 }
                 write_status(config, failure)
                 LOG.exception("每日流程失敗：%s", exc)
-                if attempt >= config.max_retries or datetime.now(config.timezone).date() != run_date:
+                final_failure = (
+                    attempt >= config.max_retries
+                    or datetime.now(config.timezone).date() != run_date
+                )
+                if final_failure:
+                    notify_failure(config, exc, scope="每日流程")
                     break
                 interruptible_sleep(stop, config.retry_minutes * 60)
                 if stop[0]:
@@ -788,6 +1031,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--once", action="store_true", help="立即執行正式流程一次")
     mode.add_argument("--check", action="store_true", help="只讀檢查登入、文章與 token")
     mode.add_argument("--status", action="store_true", help="顯示最近一次執行紀錄")
+    mode.add_argument("--test-notification", action="store_true", help="發送一則不標註使用者的 Discord 測試通知")
     mode.add_argument("--live-test", metavar="URL", help="在自己的非伺服招生文章測試發文後刪除")
     parser.add_argument(
         "--confirm-live-test",
@@ -803,6 +1047,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     args = build_parser().parse_args()
+    config: Config | None = None
     try:
         config = Config.from_env()
         config.data_dir.mkdir(parents=True, exist_ok=True)
@@ -812,6 +1057,15 @@ def main() -> int:
         with process_lock(config.data_dir / "daemon.lock"):
             if args.check:
                 print(json.dumps(run_check(config), ensure_ascii=False, indent=2))
+            elif args.test_notification:
+                if _discord_webhook_url(config) is None:
+                    raise ConfigurationError("尚未設定 Discord Webhook。")
+                if not send_discord_notification(
+                    config,
+                    "✅ Bahamut Bumper Discord Webhook 測試成功；一般成功通知不會標註你。",
+                ):
+                    raise SafetyError("Discord 測試通知發送失敗。")
+                print("Discord 測試通知已送出。")
             elif args.live_test:
                 if not args.confirm_live_test:
                     raise ConfigurationError(
@@ -830,6 +1084,8 @@ def main() -> int:
                 run_daemon(config)
         return 0
     except (ConfigurationError, AuthenticationError, SafetyError, ValueError) as exc:
+        if config is not None and (args.once or args.live_test):
+            notify_failure(config, exc, scope="手動執行")
         LOG.error("%s", exc)
         return 2
     except KeyboardInterrupt:

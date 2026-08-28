@@ -8,10 +8,12 @@ from main import (
     Post,
     build_session,
     classify_daily_posts,
+    load_cookie_records,
     parse_delete_request,
     parse_posted_at,
     parse_thread_snapshot,
     parse_wall_time,
+    persist_session_cookies,
     seconds_until,
     validate_forum_url,
     with_last_page,
@@ -67,6 +69,8 @@ class MainTests(unittest.TestCase):
             max_retries=3,
             run_missed_on_start=True,
             timeout_seconds=30,
+            discord_webhook_file=root / "discord_webhook.txt",
+            discord_user_id="523114942434639873",
         )
 
     def test_relative_and_absolute_timestamps(self):
@@ -169,6 +173,12 @@ class MainTests(unittest.TestCase):
             self.assertEqual(session.cookies.get("foo"), "bar")
             session.cookies.set("ckFORUM_pdel", "x", domain=".gamer.com.tw", path="/")
             self.assertEqual(session.cookies.get("ckFORUM_pdel"), "x")
+            session.cookies.set("rotated", "new", domain=".gamer.com.tw", path="/")
+            persist_session_cookies(session, config)
+            persisted = load_cookie_records(path)
+            persisted_names = {item["name"] for item in persisted}
+            self.assertIn("rotated", persisted_names)
+            self.assertNotIn("ckFORUM_pdel", persisted_names)
 
 
 if __name__ == "__main__":
