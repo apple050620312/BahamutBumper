@@ -27,7 +27,7 @@ PAGE = r"""
   <a class="userid" href="https://home.gamer.com.tw/sangege01">sangege01</a>
   <span class="edittime" data-mtime="2026-08-20 10:11:12"></span>
   <article>首篇</article>
-  <button class="tippy-option-menu" data-tippy='{"author":"sangege01","owner":true}'></button>
+  <button class="tippy-option-menu" data-tippy='{"author":"sangege01","owner":true,"isLogin":true}'></button>
 </section>
 <section class="c-section" id="post_1113614">
   <a class="floor" data-floor="12">12 樓</a>
@@ -107,6 +107,7 @@ class MainTests(unittest.TestCase):
             datetime(2026, 8, 28, 8, 0, tzinfo=self.tz),
         )
         self.assertTrue(snapshot.owner_verified)
+        self.assertTrue(snapshot.site_reports_login)
         self.assertEqual(snapshot.subboard, "18")
         self.assertEqual(len(snapshot.posts), 2)
         self.assertEqual(snapshot.posts[1].post_id, "1113614")
@@ -115,8 +116,8 @@ class MainTests(unittest.TestCase):
 
     def test_reply_owner_is_not_enough_to_prove_thread_ownership(self):
         page = PAGE.replace(
-            '{"author":"sangege01","owner":true}',
-            '{"author":"someone_else","owner":false}',
+            '{"author":"sangege01","owner":true,"isLogin":true}',
+            '{"author":"someone_else","owner":false,"isLogin":true}',
         ).replace(
             '<article>eee</article>',
             '<article>eee</article><button class="tippy-option-menu" '
@@ -174,11 +175,13 @@ class MainTests(unittest.TestCase):
             session.cookies.set("ckFORUM_pdel", "x", domain=".gamer.com.tw", path="/")
             self.assertEqual(session.cookies.get("ckFORUM_pdel"), "x")
             session.cookies.set("rotated", "new", domain=".gamer.com.tw", path="/")
+            session._bahamut_cookie_dirty = True
             persist_session_cookies(session, config)
             persisted = load_cookie_records(path)
             persisted_names = {item["name"] for item in persisted}
             self.assertIn("rotated", persisted_names)
             self.assertNotIn("ckFORUM_pdel", persisted_names)
+            self.assertTrue(path.with_suffix(".json.backup").is_file())
 
 
 if __name__ == "__main__":

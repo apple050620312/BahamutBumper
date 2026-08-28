@@ -69,7 +69,7 @@ python -m pip install --user -r requirements.txt && python main.py
 
 也可將完整 `Cookie: name=value; ...` 純文字放入指定檔案。Cookie 等同登入憑證：不要貼到聊天、不要提交 Git、不要傳給他人；檔案已由 `.gitignore` 排除。
 
-每次正常讀取巴哈時，程式會接收回應中的 `Set-Cookie`，合併後原子寫回 `data/cookies.json`，因此網站若採用活動式續期，新的 Cookie 會被保留下來。即將到期不會通知；只有標示期限已過、正常讀頁後仍未收到續期 Cookie，或登入實際失效時才會要求人工處理。
+每次正常讀取巴哈時，程式會接收回應中的 `Set-Cookie`。只有頁面已確認登入帳號正確、而且回應確實含 Cookie 更新時，才會合併並原子寫回 `data/cookies.json`；第一次寫回前另存 `data/cookies.json.backup`。因此網站若採用活動式續期，新的 Cookie 會被保留下來，而登出頁不能覆寫有效憑證。即將到期不會通知；只有標示期限已過、正常讀頁後仍未收到續期 Cookie，或登入實際失效時才會要求人工處理。
 
 上傳後先執行只讀檢查：
 

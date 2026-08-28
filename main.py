@@ -155,6 +155,7 @@ class ThreadSnapshot:
     form_fields: dict[str, str]
     subboard: str | None
     owner_verified: bool
+    site_reports_login: bool | None
 
 
 @dataclass(frozen=True)
@@ -320,6 +321,8 @@ def build_session(config: Config) -> Any:
 
 def persist_session_cookies(session: Any, config: Config) -> None:
     """Atomically preserve any Set-Cookie rotations received from Bahamut."""
+    if not getattr(session, "_bahamut_cookie_dirty", False):
+        return
     records = []
     for cookie in session.cookies:
         if cookie.name == "ckFORUM_pdel":
@@ -339,10 +342,16 @@ def persist_session_cookies(session: Any, config: Config) -> None:
     config.cookie_file.parent.mkdir(parents=True, exist_ok=True)
     temporary = config.cookie_file.with_suffix(config.cookie_file.suffix + ".tmp")
     try:
+        backup = config.cookie_file.with_suffix(config.cookie_file.suffix + ".backup")
+        if config.cookie_file.is_file() and not backup.exists():
+            backup.write_bytes(config.cookie_file.read_bytes())
+            if os.name != "nt":
+                backup.chmod(0o600)
         temporary.write_text(
             json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         temporary.replace(config.cookie_file)
+        setattr(session, "_bahamut_cookie_dirty", False)
         if os.name != "nt":
             config.cookie_file.chmod(0o600)
     except OSError as exc:
@@ -353,6 +362,12 @@ def persist_session_cookies(session: Any, config: Config) -> None:
             pass
 
 
+def mark_cookie_updates(session: Any, response: Any) -> None:
+    responses = [*getattr(response, "history", []), response]
+    if any(len(item.cookies) > 0 for item in responses):
+        setattr(session, "_bahamut_cookie_dirty", True)
+
+
 def request_page(session: Any, url: str, config: Config) -> tuple[str, str]:
     try:
         response = session.get(url, timeout=config.timeout_seconds, allow_redirects=True)
@@ -360,7 +375,7 @@ def request_page(session: Any, url: str, config: Config) -> tuple[str, str]:
     except Exception as exc:
         raise SafetyError(f"讀取巴哈頁面失敗：{exc}") from exc
     ensure_no_challenge(response.text, response.url)
-    persist_session_cookies(session, config)
+    mark_cookie_updates(session, response)
     return response.text, response.url
 
 
@@ -390,7 +405,7 @@ def _post_author(section: Any) -> str:
     return ""
 
 
-def _owner_metadata(soup: Any, account: str) -> dict[str, Any] | None:
+def _first_post_metadata(soup: Any) -> dict[str, Any] | None:
     first_post = None
     for section in soup.select('section.c-section[id^="post_"]'):
         floor = section.select_one("a.floor[data-floor]") or section.select_one("a.floor")
@@ -407,10 +422,7 @@ def _owner_metadata(soup: Any, account: str) -> dict[str, Any] | None:
             data = json.loads(raw)
         except (TypeError, json.JSONDecodeError):
             continue
-        if (
-            str(data.get("author", "")).casefold() == account.casefold()
-            and data.get("owner") is True
-        ):
+        if "author" in data:
             return data
     return None
 
@@ -456,7 +468,15 @@ def parse_thread_snapshot(
         for node in form.select("input[name]"):
             fields[str(node.get("name"))] = str(node.get("value") or "")
 
-    owner_metadata = _owner_metadata(soup, account)
+    owner_metadata = _first_post_metadata(soup)
+    owner_verified = bool(
+        owner_metadata
+        and str(owner_metadata.get("author", "")).casefold() == account.casefold()
+        and owner_metadata.get("owner") is True
+    )
+    site_reports_login = None
+    if owner_metadata and "isLogin" in owner_metadata:
+        site_reports_login = owner_metadata.get("isLogin") is True
     metadata_subboard = None
     if owner_metadata and owner_metadata.get("subbsn") is not None:
         metadata_subboard = str(owner_metadata["subbsn"])
@@ -472,7 +492,8 @@ def parse_thread_snapshot(
         form_action=form_action,
         form_fields=fields,
         subboard=subboard,
-        owner_verified=owner_metadata is not None,
+        owner_verified=owner_verified,
+        site_reports_login=site_reports_login,
     )
 
 
@@ -486,6 +507,15 @@ def fetch_snapshot(session: Any, url: str, config: Config) -> ThreadSnapshot:
 
 def assert_owner_login(snapshot: ThreadSnapshot, config: Config) -> None:
     if not snapshot.owner_verified:
+        if snapshot.site_reports_login is False:
+            raise AuthenticationError(
+                "巴哈頁面明確回報目前未登入；Cookie 未被 Pterodactyl 端接受，"
+                "或已在伺服器端失效。請重新上傳原始 Cookie 後於 Pterodactyl Console 執行 --check。"
+            )
+        if snapshot.site_reports_login is True:
+            raise AuthenticationError(
+                f"巴哈頁面顯示已登入，但不是文章作者 {config.account}；請確認匯出的帳號。"
+            )
         raise AuthenticationError(
             f"無法證明目前 Cookie 是文章作者 {config.account}；可能已登出、帳號錯誤或頁面改版。"
         )
@@ -518,6 +548,7 @@ def post_reply(session: Any, snapshot: ThreadSnapshot, message: str, config: Con
     except Exception as exc:
         raise SafetyError(f"送出回覆時發生網路錯誤：{exc}；將重新讀頁確認，不會刪舊文。") from exc
     ensure_no_challenge(response.text, response.url)
+    mark_cookie_updates(session, response)
 
 
 def parse_delete_request(snapshot: ThreadSnapshot, post: Post) -> DeleteRequest:
@@ -567,6 +598,7 @@ def delete_post(
     except Exception as exc:
         raise SafetyError(f"刪文請求失敗：{exc}；請人工確認網站狀態。") from exc
     ensure_no_challenge(response.text, response.url)
+    mark_cookie_updates(session, response)
 
 
 def classify_daily_posts(
@@ -591,6 +623,8 @@ def classify_daily_posts(
 def check_guard_threads(session: Any, config: Config, today: date) -> None:
     for url in config.guard_urls:
         snapshot = fetch_snapshot(session, url, config)
+        assert_owner_login(snapshot, config)
+        persist_session_cookies(session, config)
         guarded_today = [
             post
             for post in own_posts(snapshot, config.account)
@@ -625,6 +659,7 @@ def run_check(config: Config) -> dict[str, Any]:
     session = build_session(config)
     snapshot = fetch_snapshot(session, config.target_url, config)
     assert_owner_login(snapshot, config)
+    persist_session_cookies(session, config)
     notify_cookie_expiry(config)
     now = datetime.now(config.timezone)
     today_posts, yesterday_posts = classify_daily_posts(snapshot, config, now)
@@ -634,6 +669,7 @@ def run_check(config: Config) -> dict[str, Any]:
         "target": config.target_url,
         "account": config.account,
         "owner_verified": snapshot.owner_verified,
+        "site_reports_login": snapshot.site_reports_login,
         "subboard": snapshot.subboard,
         "parsed_posts": len(snapshot.posts),
         "today_own_replies": [asdict_post(post) for post in today_posts],
@@ -648,6 +684,7 @@ def run_once(config: Config) -> dict[str, Any]:
     session = build_session(config)
     snapshot = fetch_snapshot(session, config.target_url, config)
     assert_owner_login(snapshot, config)
+    persist_session_cookies(session, config)
     notify_cookie_expiry(config)
     now = datetime.now(config.timezone)
     today_posts, yesterday_posts = classify_daily_posts(snapshot, config, now)
@@ -661,6 +698,7 @@ def run_once(config: Config) -> dict[str, Any]:
         post_reply(session, snapshot, config.message, config)
         verified = fetch_snapshot(session, config.target_url, config)
         assert_owner_login(verified, config)
+        persist_session_cookies(session, config)
         new_post = verify_new_post(
             verified, config, before_ids, datetime.now(config.timezone).date(), config.message
         )
@@ -672,12 +710,16 @@ def run_once(config: Config) -> dict[str, Any]:
 
     if old_post is not None:
         fresh = fetch_snapshot(session, config.target_url, config)
+        assert_owner_login(fresh, config)
+        persist_session_cookies(session, config)
         fresh_today, _ = classify_daily_posts(fresh, config, datetime.now(config.timezone))
         if len(fresh_today) != 1:
             raise SafetyError("刪文前無法確認今天恰有一則自己的回覆；不刪舊文。")
         LOG.info("準備刪除昨天的 %d 樓（%s）。", old_post.floor, old_post.post_id)
         delete_post(session, fresh, old_post, config)
         after_delete = fetch_snapshot(session, config.target_url, config)
+        assert_owner_login(after_delete, config)
+        persist_session_cookies(session, config)
         if any(post.post_id == old_post.post_id for post in after_delete.posts):
             raise SafetyError("刪文後舊樓層仍存在；請人工檢查。")
         LOG.info("已驗證昨天的 %d 樓刪除成功。", old_post.floor)
@@ -703,6 +745,7 @@ def live_round_trip_test(config: Config, test_url: str) -> dict[str, Any]:
     session = build_session(config)
     snapshot = fetch_snapshot(session, test_url, config)
     assert_owner_login(snapshot, config)
+    persist_session_cookies(session, config)
     if snapshot.subboard is None:
         raise SafetyError("無法辨識測試文章分類；拒絕發文。")
     if snapshot.subboard == "18":
@@ -714,12 +757,18 @@ def live_round_trip_test(config: Config, test_url: str) -> dict[str, Any]:
     LOG.warning("即時測試將公開回覆：%s", message)
     post_reply(session, snapshot, message, config)
     verified = fetch_snapshot(session, test_url, config)
+    assert_owner_login(verified, config)
+    persist_session_cookies(session, config)
     test_post = verify_new_post(
         verified, config, before_ids, datetime.now(config.timezone).date(), message
     )
     fresh = fetch_snapshot(session, test_url, config)
+    assert_owner_login(fresh, config)
+    persist_session_cookies(session, config)
     delete_post(session, fresh, test_post, config)
     after = fetch_snapshot(session, test_url, config)
+    assert_owner_login(after, config)
+    persist_session_cookies(session, config)
     if any(post.post_id == test_post.post_id for post in after.posts):
         raise SafetyError("測試回覆未能驗證刪除；請立即人工處理。")
     result = {
@@ -1013,6 +1062,8 @@ def run_daemon(config: Config) -> None:
                 }
                 write_status(config, failure)
                 LOG.exception("每日流程失敗：%s", exc)
+                if isinstance(exc, AuthenticationError):
+                    notify_failure(config, exc, scope="每日流程")
                 final_failure = (
                     attempt >= config.max_retries
                     or datetime.now(config.timezone).date() != run_date
