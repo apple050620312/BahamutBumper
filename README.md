@@ -2,11 +2,12 @@
 
 這是放進一般 Pterodactyl **Python Generic Egg** 就能執行的常駐程式，不需要 Chromium、Playwright 或自訂 Docker image。它使用匯出的巴哈 Cookie，以普通 HTTPS 請求完成：
 
-1. 每天台北時間 `20:30` 檢查目標文章。
-2. 當天尚未自推才回覆「推」。
-3. 重新讀取文章，唯一驗證新樓層存在。
-4. 再讀一次最新頁面與刪文 token，刪除昨天自己的回覆。
-5. 再次確認舊樓層已消失，將結果寫入 `data/status.json`。
+1. 每天台北時間 `20:30` 先以 password-only mobile API 取得新的登入 Cookie。
+2. 驗證 API 與論壇帳號都是 `sangege01`。
+3. 當天尚未自推才回覆「推」。
+4. 重新讀取文章，唯一驗證新樓層存在。
+5. 再讀一次最新頁面與刪文 token，刪除昨天自己的回覆。
+6. 再次確認舊樓層已消失，將結果寫入 `data/status.json`。
 
 任何一步無法明確確認就停止；尤其新回覆沒有驗證成功時，絕不刪昨天的回覆。
 
@@ -71,13 +72,33 @@ python -m pip install --user -r requirements.txt && python main.py
 
 每次正常讀取巴哈時，程式會接收回應中的 `Set-Cookie`。只有頁面已確認登入帳號正確、而且回應確實含 Cookie 更新時，才會合併並原子寫回 `data/cookies.json`；第一次寫回前另存 `data/cookies.json.backup`。因此網站若採用活動式續期，新的 Cookie 會被保留下來，而登出頁不能覆寫有效憑證。即將到期不會通知；只有標示期限已過、正常讀頁後仍未收到續期 Cookie，或登入實際失效時才會要求人工處理。
 
+## Production 每日 mobile API 登入
+
+巴哈 Cookie 實測可能隔日失效，因此 production 預設 `AUTO_MOBILE_LOGIN=true`。請在自己的電腦建立純文字檔 `bahamut_password.txt`，內容只放巴哈密碼，再上傳到：
+
+```text
+data/bahamut_password.txt
+```
+
+不要把密碼貼到 Console、Discord、聊天或 Git。`data/` 已被 `.gitignore` 排除；Linux 上建議將檔案權限設為 `600`。主機管理員仍可能讀取容器檔案，請只在你信任的 Pterodactyl 主機使用。
+
+每天正式流程、`check`、`once` 都會先嘗試一次 mobile API 登入。它只使用帳號、密碼及 API 所需的配對 `vcode`，不處理或規避 reCAPTCHA。若 API 要求人機、新裝置、E-mail 或其他驗證，流程停止並透過 Discord @ 你。
+
+可在 Pterodactyl Console 單獨測試，不會發文或刪文：
+
+```text
+login-test
+```
+
+成功後會看到 `forum_owner_verified: true` 與 `cookie_saved: true`。同一 Console 指令五分鐘內只允許嘗試一次；production 排程則仍受 `MAX_RETRIES` 限制。
+
 啟動伺服器後，直接在 Pterodactyl Console 輸入只讀指令（不要加 `python main.py`）：
 
 ```text
 check
 ```
 
-成功時會看到 `"ok": true`、`"owner_verified": true`、`"reply_form": true`。這一步不發文、不刪文。
+成功時會看到 `"ok": true`、`"owner_verified": true`、`"reply_form": true`。這一步會建立登入 session 並更新 Cookie，但不發文、不刪文。
 
 ## 安全測試順序
 
@@ -125,7 +146,7 @@ once
 status
 ```
 
-其他 Console 指令：`next` 顯示下次排程、`help` 顯示完整說明、`stop` 安全停止。原有 `python main.py --check` 等參數仍可在一般 Shell 使用，但 Pterodactyl Console 不需要也不能這樣輸入。
+其他 Console 指令：`login-test` 只測 mobile API 登入、`next` 顯示下次排程、`help` 顯示完整說明、`stop` 安全停止。原有 `python main.py --check` 等參數仍可在一般 Shell 使用，但 Pterodactyl Console 不需要也不能這樣輸入。
 
 ## Discord 通知
 
@@ -145,6 +166,8 @@ test-notification
 ## 例外狀況如何處理
 
 - **Cookie 過期、錯誤帳號或無權回覆**：停止，不發文；重新登入並匯出 Cookie。
+- **mobile API 登入成功**：先驗證 API 帳號及論壇樓主，再保存新 Cookie 並繼續每日流程。
+- **mobile API 要求額外驗證**：停止且 Discord @；不嘗試繞過 reCAPTCHA。
 - **網站主動續期 Cookie**：自動保存到原 Cookie 檔，不需人工處理。
 - **CAPTCHA／Cloudflare 人機驗證**：停止，不繞過；用瀏覽器人工處理後更新 Cookie。
 - **送出時斷線，結果不明**：不刪舊文。常駐模式稍後重試時會先重讀文章；若今日回覆已存在便不會重複發。
@@ -159,6 +182,7 @@ test-notification
 ## 已知限制
 
 - 巴哈不是穩定公開 API；HTML、JavaScript 或 `post2.php` 參數改版時腳本會停止，需要更新解析器。
+- mobile API 不是巴哈承諾穩定的公開介面；端點、欄位或驗證政策改變時會安全停止。
 - 直接 HTTP 可能被網站新增的人機驗證阻擋，程式不會規避。
 - Cookie 會過期，且 `--check` 通過只代表讀取、登入與表單解析正常；要證明寫入及刪除必須跑一次 `--live-test`。
 - 程式只能檢查 `BAHAMUT_TARGET_URL` 與你列入 `BAHAMUT_GUARD_URLS` 的文章。若你另有伺服招生文卻沒列入，程式不知道同日是否已在別篇自推。
@@ -172,6 +196,8 @@ test-notification
 | `BUMP_TIME` | `20:30` | `TZ` 時區的每日時間 |
 | `TZ` | `Asia/Taipei` | 日界線與排程時區 |
 | `BAHAMUT_COOKIE_FILE` | `data/cookies.json` | Cookie 檔位置 |
+| `AUTO_MOBILE_LOGIN` | `true` | 每次正式／檢查流程前先重新登入取得 Cookie |
+| `BAHAMUT_PASSWORD_FILE` | `data/bahamut_password.txt` | 只含巴哈密碼的 Git 忽略檔 |
 | `BAHAMUT_DELETE_MESSAGES` | `推,eee` | 允許刪除的昨日回覆文字 |
 | `BAHAMUT_GUARD_URLS` | 空白 | 其他本人伺服招生文，逗號分隔 |
 | `RUN_MISSED_ON_START` | `true` | 錯過時間後重啟是否立即補檢查 |

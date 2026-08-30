@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from main import (
+    ConfigurationError,
     Config,
     Post,
     build_session,
@@ -11,6 +12,7 @@ from main import (
     console_help,
     execute_console_command,
     load_cookie_records,
+    mobile_login,
     parse_delete_request,
     parse_posted_at,
     parse_thread_snapshot,
@@ -73,6 +75,8 @@ class MainTests(unittest.TestCase):
             timeout_seconds=30,
             discord_webhook_file=root / "discord_webhook.txt",
             discord_user_id="523114942434639873",
+            password_file=root / "bahamut_password.txt",
+            auto_mobile_login=True,
         )
 
     def test_relative_and_absolute_timestamps(self):
@@ -103,8 +107,14 @@ class MainTests(unittest.TestCase):
 
     def test_pterodactyl_console_commands(self):
         self.assertIn("check", console_help())
+        self.assertIn("login-test", console_help())
         self.assertFalse(execute_console_command("help", self.config()))
         self.assertTrue(execute_console_command("stop", self.config()))
+
+    def test_mobile_login_requires_local_password_file_before_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ConfigurationError):
+                mobile_login(self.config(Path(directory)))
 
     def test_snapshot_parsing_and_owner_proof(self):
         snapshot = parse_thread_snapshot(

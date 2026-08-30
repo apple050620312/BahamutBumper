@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 LOG = logging.getLogger("bahamut-bumper")
 DEFAULT_URL = "https://forum.gamer.com.tw/C.php?bsn=18673&snA=205415"
 FORUM_HOST = "forum.gamer.com.tw"
+MOBILE_LOGIN_URL = "https://api.gamer.com.tw/mobile_app/user/v3/do_login.php"
 FULL_TIMESTAMP = re.compile(
     r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})(?::(\d{2}))?"
 )
@@ -75,6 +76,8 @@ class Config:
     timeout_seconds: int
     discord_webhook_file: Path
     discord_user_id: str
+    password_file: Path
+    auto_mobile_login: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -137,6 +140,12 @@ class Config:
                 )
             ).expanduser().resolve(),
             discord_user_id=discord_user_id,
+            password_file=Path(
+                os.getenv(
+                    "BAHAMUT_PASSWORD_FILE", str(data_dir / "bahamut_password.txt")
+                )
+            ).expanduser().resolve(),
+            auto_mobile_login=env_bool("AUTO_MOBILE_LOGIN", True),
         )
 
 
@@ -284,7 +293,7 @@ def load_cookie_records(path: Path) -> list[dict[str, Any]]:
         return records
 
 
-def build_session(config: Config) -> Any:
+def new_forum_session() -> Any:
     requests, _ = import_http_dependencies()
     session = requests.Session()
     session.headers.update(
@@ -297,7 +306,11 @@ def build_session(config: Config) -> Any:
             "Cache-Control": "no-cache",
         }
     )
-    for record in load_cookie_records(config.cookie_file):
+    return session
+
+
+def add_cookie_records(session: Any, records: list[dict[str, Any]]) -> None:
+    for record in records:
         name = str(record.get("name", "")).strip()
         value = str(record.get("value", ""))
         if not name:
@@ -317,6 +330,11 @@ def build_session(config: Config) -> Any:
             expires=expires,
             secure=bool(record.get("secure", False)),
         )
+
+
+def build_session(config: Config) -> Any:
+    session = new_forum_session()
+    add_cookie_records(session, load_cookie_records(config.cookie_file))
     if not session.cookies:
         raise AuthenticationError("Cookie 檔沒有任何有效 Cookie。")
     return session
@@ -526,6 +544,157 @@ def assert_owner_login(snapshot: ThreadSnapshot, config: Config) -> None:
         raise AuthenticationError("找不到快速回覆表單；Cookie 可能失效或帳號不能回覆。")
 
 
+def read_secret_file(path: Path, label: str) -> str:
+    if not path.is_file():
+        raise ConfigurationError(f"找不到 {label} 檔：{path}")
+    try:
+        value = path.read_text(encoding="utf-8-sig").strip()
+    except OSError as exc:
+        raise ConfigurationError(f"無法讀取 {label} 檔。") from exc
+    if not value:
+        raise ConfigurationError(f"{label} 檔是空的。")
+    if len(value) > 1024:
+        raise ConfigurationError(f"{label} 檔內容異常過長。")
+    return value
+
+
+def record_mobile_login_attempt(config: Config) -> None:
+    """Limit manual login tests to one request per five minutes."""
+    path = config.data_dir / "mobile_login_attempt.json"
+    now_epoch = time.time()
+    if path.is_file():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            elapsed = now_epoch - float(payload.get("attempted_at_epoch", 0))
+            if elapsed < 300:
+                wait_seconds = max(1, int(300 - elapsed))
+                raise SafetyError(
+                    f"mobile API 登入測試五分鐘內只能一次；請等待 {wait_seconds} 秒。"
+                )
+        except json.JSONDecodeError:
+            pass
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "attempted_at": datetime.now(config.timezone).isoformat(),
+                "attempted_at_epoch": now_epoch,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _mobile_error_message(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "mobile API 未回傳可辨識的登入結果"
+    message = payload.get("message")
+    error = payload.get("error")
+    if not message and isinstance(error, dict):
+        message = error.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return "mobile API 未核發登入 Cookie"
+    return re.sub(r"[\r\n]+", " ", message.strip())[:200]
+
+
+def mobile_login(
+    config: Config, *, enforce_rate_limit: bool = False, notify_success: bool = False
+) -> dict[str, Any]:
+    """Perform password-only mobile login, then prove forum ownership."""
+    password = read_secret_file(config.password_file, "巴哈密碼")
+    if enforce_rate_limit:
+        record_mobile_login_attempt(config)
+    requests, _ = import_http_dependencies()
+    mobile = requests.Session()
+    mobile.headers.update(
+        {
+            "User-Agent": "Bahadroid (https://www.gamer.com.tw/)",
+            "Accept-Language": "zh-TW,zh;q=0.9",
+        }
+    )
+    mobile.cookies.set("ckAPP_VCODE", "7045", domain="api.gamer.com.tw", path="/")
+    try:
+        response = mobile.post(
+            MOBILE_LOGIN_URL,
+            data={"uid": config.account, "passwd": password, "vcode": "7045"},
+            timeout=config.timeout_seconds,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        raise AuthenticationError(
+            f"mobile API 登入連線失敗（{type(exc).__name__}）。"
+        ) from exc
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        lower = response.text.casefold()
+        if "recaptcha" in lower or "captcha" in lower or "驗證" in response.text:
+            raise AuthenticationError(
+                "mobile API 要求額外的人機／新裝置驗證；腳本不會繞過。"
+            ) from exc
+        raise AuthenticationError("mobile API 未回傳 JSON 登入結果。") from exc
+
+    userid = str(payload.get("userid", "")) if isinstance(payload, dict) else ""
+    rune = next(
+        (cookie.value for cookie in mobile.cookies if cookie.name == "BAHARUNE"), None
+    )
+    if userid.casefold() != config.account.casefold() or not rune:
+        raise AuthenticationError(f"mobile API 登入失敗：{_mobile_error_message(payload)}")
+
+    forum = new_forum_session()
+    if config.cookie_file.is_file():
+        try:
+            add_cookie_records(forum, load_cookie_records(config.cookie_file))
+        except (AuthenticationError, ConfigurationError):
+            pass
+    received_names: list[str] = []
+    for cookie in mobile.cookies:
+        received_names.append(cookie.name)
+        forum.cookies.set(
+            cookie.name,
+            cookie.value,
+            domain=".gamer.com.tw",
+            path=cookie.path or "/",
+            expires=cookie.expires,
+            secure=bool(cookie.secure),
+        )
+    forum.cookies.set(
+        "BAHARUNE", rune, domain=".gamer.com.tw", path="/", secure=True
+    )
+    setattr(forum, "_bahamut_cookie_dirty", True)
+    snapshot = fetch_snapshot(forum, config.target_url, config)
+    assert_owner_login(snapshot, config)
+    persist_session_cookies(forum, config)
+    result = {
+        "ok": True,
+        "tested_at": datetime.now(config.timezone).isoformat(),
+        "api_account": userid,
+        "forum_owner_verified": snapshot.owner_verified,
+        "received_cookie_names": sorted(set(received_names)),
+        "cookie_saved": True,
+        "posted": False,
+        "deleted": False,
+    }
+    if notify_success:
+        send_discord_notification(
+            config,
+            "✅ 巴哈 mobile API 帳密登入測試成功，並已驗證論壇帳號；沒有發文或刪文。",
+            dedupe_key=f"mobile-login-test-{datetime.now(config.timezone).date().isoformat()}",
+        )
+    return result
+
+
+def refresh_login_for_production(config: Config) -> None:
+    if not config.auto_mobile_login:
+        return
+    LOG.info("使用 mobile API 更新本次流程的巴哈登入 Cookie。")
+    mobile_login(config)
+
+
 def own_posts(snapshot: ThreadSnapshot, account: str) -> list[Post]:
     return [
         post
@@ -659,6 +828,7 @@ def verify_new_post(
 
 
 def run_check(config: Config) -> dict[str, Any]:
+    refresh_login_for_production(config)
     session = build_session(config)
     snapshot = fetch_snapshot(session, config.target_url, config)
     assert_owner_login(snapshot, config)
@@ -684,6 +854,7 @@ def run_check(config: Config) -> dict[str, Any]:
 
 
 def run_once(config: Config) -> dict[str, Any]:
+    refresh_login_for_production(config)
     session = build_session(config)
     snapshot = fetch_snapshot(session, config.target_url, config)
     assert_owner_login(snapshot, config)
@@ -745,6 +916,7 @@ def live_round_trip_test(config: Config, test_url: str) -> dict[str, Any]:
     test_url = validate_forum_url(test_url)
     if thread_identity(test_url) == thread_identity(config.target_url):
         raise SafetyError("即時測試禁止使用正式自推文章。")
+    refresh_login_for_production(config)
     session = build_session(config)
     snapshot = fetch_snapshot(session, test_url, config)
     assert_owner_login(snapshot, config)
@@ -1042,6 +1214,7 @@ def console_help() -> str:
         "  status                 顯示最近一次執行結果\n"
         "  next                   顯示下次排程時間\n"
         "  test-notification      發送不 @ 使用者的 Discord 測試通知\n"
+        "  login-test             只測試 mobile API 登入並更新 Cookie\n"
         "  live-test <URL> CONFIRM 在自己的非伺服招生文章測試發文後刪除\n"
         "  help                   顯示本說明\n"
         "  stop                   安全停止程式"
@@ -1081,6 +1254,17 @@ def execute_console_command(line: str, config: Config) -> bool:
             ):
                 raise SafetyError("Discord 測試通知發送失敗。")
             print("Discord 測試通知已送出。", flush=True)
+        elif command == "login-test":
+            print(
+                json.dumps(
+                    mobile_login(
+                        config, enforce_rate_limit=True, notify_success=True
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                flush=True,
+            )
         elif command == "live-test":
             if len(parts) != 3 or parts[2] != "CONFIRM":
                 raise ConfigurationError("用法：live-test <URL> CONFIRM")
