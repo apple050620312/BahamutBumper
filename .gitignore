@@ -5,3 +5,4 @@ data/
 cookies*.json
 storage_state*.json
 .pytest_cache/
+/bahamut.zip
