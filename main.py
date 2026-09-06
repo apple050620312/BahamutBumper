@@ -845,18 +845,17 @@ def classify_daily_posts(
 ) -> tuple[list[Post], list[Post]]:
     posts = own_posts(snapshot, config.account)
     today_posts = [post for post in posts if post.posted_at.date() == now.date()]
-    yesterday = now.date() - timedelta(days=1)
-    yesterday_posts = [
+    previous_posts = [
         post
         for post in posts
-        if post.posted_at.date() == yesterday
+        if post.posted_at.date() < now.date()
         and post.content.strip() in config.deletable_messages
     ]
     if len(today_posts) > 1:
         raise SafetyError("偵測到今天已有多則自己的回覆；停止並請人工檢查。")
-    if len(yesterday_posts) > 1:
-        raise SafetyError("偵測到昨天有多則符合刪除文字的回覆；為避免刪錯，停止操作。")
-    return today_posts, yesterday_posts
+    if len(previous_posts) > 1:
+        raise SafetyError("偵測到多則過去的自推回覆；為避免刪錯，停止並請人工檢查。")
+    return today_posts, previous_posts
 
 
 def check_guard_threads(session: Any, config: Config, today: date) -> None:
@@ -902,7 +901,8 @@ def run_check(config: Config) -> dict[str, Any]:
     persist_session_cookies(session, config)
     notify_cookie_expiry(config)
     now = datetime.now(config.timezone)
-    today_posts, yesterday_posts = classify_daily_posts(snapshot, config, now)
+    today_posts, previous_posts = classify_daily_posts(snapshot, config, now)
+    yesterday = now.date() - timedelta(days=1)
     return {
         "ok": True,
         "checked_at": now.isoformat(),
@@ -913,7 +913,14 @@ def run_check(config: Config) -> dict[str, Any]:
         "subboard": snapshot.subboard,
         "parsed_posts": len(snapshot.posts),
         "today_own_replies": [asdict_post(post) for post in today_posts],
-        "yesterday_own_replies": [asdict_post(post) for post in yesterday_posts],
+        "previous_own_bump_replies": [
+            asdict_post(post) for post in previous_posts
+        ],
+        "yesterday_own_replies": [
+            asdict_post(post)
+            for post in previous_posts
+            if post.posted_at.date() == yesterday
+        ],
         "reply_form": bool(snapshot.form_action),
         "delete_token": bool(PDEL_PATTERN.search(snapshot.html_text)),
         "guard_urls": list(config.guard_urls),
@@ -928,8 +935,8 @@ def run_once(config: Config) -> dict[str, Any]:
     persist_session_cookies(session, config)
     notify_cookie_expiry(config)
     now = datetime.now(config.timezone)
-    today_posts, yesterday_posts = classify_daily_posts(snapshot, config, now)
-    old_post = yesterday_posts[0] if yesterday_posts else None
+    today_posts, previous_posts = classify_daily_posts(snapshot, config, now)
+    old_post = previous_posts[0] if previous_posts else None
     old_post_page = snapshot.page_number if old_post is not None else None
     if old_post is not None and old_post_page is None:
         raise SafetyError("無法辨識昨天回覆所在頁碼；為避免留下重複推文，停止操作。")
@@ -981,7 +988,7 @@ def run_once(config: Config) -> dict[str, Any]:
             raise SafetyError("刪文後舊樓層仍存在；請人工檢查。")
         LOG.info("已驗證昨天的 %d 樓刪除成功。", old_post.floor)
     else:
-        LOG.info("找不到昨天自己的回覆，無需刪除。")
+        LOG.info("找不到今天以前、且文字符合刪除清單的自推回覆，無需刪除。")
 
     result = {
         "ok": True,

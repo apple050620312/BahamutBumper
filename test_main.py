@@ -189,8 +189,8 @@ class MainTests(unittest.TestCase):
 
     def test_run_once_deletes_previous_reply_across_any_page_boundary(self):
         now = datetime.now(self.tz)
-        yesterday = datetime.combine(
-            now.date() - timedelta(days=1), parse_wall_time("20:30"), tzinfo=self.tz
+        previous = datetime.combine(
+            now.date() - timedelta(days=2), parse_wall_time("20:30"), tzinfo=self.tz
         )
         today = datetime.combine(now.date(), parse_wall_time("20:30"), tzinfo=self.tz)
 
@@ -209,7 +209,7 @@ class MainTests(unittest.TestCase):
 
         for old_page in (2, 137):
             with self.subTest(old_page=old_page):
-                old_post = Post(str(old_page * 20), old_page * 20, "sangege01", yesterday, "推")
+                old_post = Post(str(old_page * 20), old_page * 20, "sangege01", previous, "推")
                 new_post = Post(
                     str(old_page * 20 + 1),
                     old_page * 20 + 1,
@@ -313,6 +313,21 @@ class MainTests(unittest.TestCase):
             ordinary_snapshot, self.config(), datetime(2026, 8, 28, tzinfo=self.tz)
         )
         self.assertEqual(ordinary_yesterday, [])
+
+    def test_daily_classification_finds_bump_older_than_yesterday(self):
+        old_page = PAGE.replace(
+            "2026-08-27 20:24:59", "2026-08-25 20:24:59"
+        ).replace("<article>eee</article>", "<article>推</article>")
+        snapshot = parse_thread_snapshot(
+            old_page, self.url, "sangege01", datetime(2026, 8, 28, tzinfo=self.tz)
+        )
+
+        today, previous = classify_daily_posts(
+            snapshot, self.config(), datetime(2026, 8, 28, tzinfo=self.tz)
+        )
+
+        self.assertEqual(today, [])
+        self.assertEqual([post.floor for post in previous], [12])
 
     def test_raw_cookie_header_is_loaded_into_cookie_jar(self):
         with tempfile.TemporaryDirectory() as directory:
