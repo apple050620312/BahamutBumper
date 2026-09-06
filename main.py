@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time as wall_time, timedelta
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -168,6 +168,7 @@ class ThreadSnapshot:
     subboard: str | None
     owner_verified: bool
     site_reports_login: bool | None
+    page_number: int | None
 
 
 @dataclass(frozen=True)
@@ -219,6 +220,16 @@ def with_last_page(url: str) -> str:
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query["last"] = "1"
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), "down"))
+
+
+def with_page(url: str, page: int) -> str:
+    if page < 1:
+        raise ValueError("頁碼必須大於等於 1。")
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.pop("last", None)
+    query["page"] = str(page)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
 
 def parse_posted_at(text: str, today: date, timezone: ZoneInfo) -> datetime | None:
@@ -506,6 +517,15 @@ def parse_thread_snapshot(
         match = re.search(r"threadSubbsn=(\d+)", page_text)
         subboard = match.group(1) if match else None
 
+    page_number = None
+    current_page = soup.select_one(".BH-pagebtnA .pagenow") or soup.select_one("a.pagenow")
+    if current_page:
+        page_match = re.search(r"\d+", current_page.get_text(" ", strip=True))
+        if page_match:
+            page_number = int(page_match.group())
+    if page_number is None and any(post.floor == 1 for post in posts):
+        page_number = 1
+
     return ThreadSnapshot(
         url=url,
         html_text=page_text,
@@ -515,15 +535,62 @@ def parse_thread_snapshot(
         subboard=subboard,
         owner_verified=owner_verified,
         site_reports_login=site_reports_login,
+        page_number=page_number,
     )
 
 
-def fetch_snapshot(session: Any, url: str, config: Config) -> ThreadSnapshot:
-    page_text, final_url = request_page(session, with_last_page(url), config)
+def _fetch_snapshot_at(
+    session: Any,
+    thread_url: str,
+    request_url: str,
+    config: Config,
+    *,
+    allow_empty: bool = False,
+) -> ThreadSnapshot:
+    page_text, final_url = request_page(session, request_url, config)
     snapshot = parse_thread_snapshot(page_text, final_url, config.account, datetime.now(config.timezone))
-    if not snapshot.posts:
+    if not snapshot.posts and not allow_empty:
         raise SafetyError("頁面中找不到任何可解析樓層；可能是頁面結構已變更。")
+    if not any(post.floor == 1 for post in snapshot.posts):
+        # `last=1` opens the final page. Once a thread has more than one page,
+        # that page no longer contains the OP metadata used to prove that the
+        # authenticated account owns the thread. Fetch page 1 only for that
+        # proof while preserving the final-page posts and reply form.
+        first_text, first_url = request_page(session, thread_url, config)
+        first_page = parse_thread_snapshot(
+            first_text, first_url, config.account, datetime.now(config.timezone)
+        )
+        if not first_page.posts or not any(
+            post.floor == 1 for post in first_page.posts
+        ):
+            raise SafetyError("第一頁中找不到文章首樓；可能是頁面結構已變更。")
+        snapshot = replace(
+            snapshot,
+            owner_verified=first_page.owner_verified,
+            site_reports_login=first_page.site_reports_login,
+        )
     return snapshot
+
+
+def fetch_snapshot(session: Any, url: str, config: Config) -> ThreadSnapshot:
+    return _fetch_snapshot_at(session, url, with_last_page(url), config)
+
+
+def fetch_page_snapshot(
+    session: Any,
+    url: str,
+    page: int,
+    config: Config,
+    *,
+    allow_empty: bool = False,
+) -> ThreadSnapshot:
+    return _fetch_snapshot_at(
+        session,
+        url,
+        with_page(url, page),
+        config,
+        allow_empty=allow_empty,
+    )
 
 
 def assert_owner_login(snapshot: ThreadSnapshot, config: Config) -> None:
@@ -531,7 +598,7 @@ def assert_owner_login(snapshot: ThreadSnapshot, config: Config) -> None:
         if snapshot.site_reports_login is False:
             raise AuthenticationError(
                 "巴哈頁面明確回報目前未登入；Cookie 未被 Pterodactyl 端接受，"
-                "或已在伺服器端失效。請重新上傳原始 Cookie 後於 Pterodactyl Console 執行 --check。"
+                "或已在伺服器端失效。請確認帳密檔後於 Pterodactyl Console 輸入 login-test。"
             )
         if snapshot.site_reports_login is True:
             raise AuthenticationError(
@@ -863,6 +930,9 @@ def run_once(config: Config) -> dict[str, Any]:
     now = datetime.now(config.timezone)
     today_posts, yesterday_posts = classify_daily_posts(snapshot, config, now)
     old_post = yesterday_posts[0] if yesterday_posts else None
+    old_post_page = snapshot.page_number if old_post is not None else None
+    if old_post is not None and old_post_page is None:
+        raise SafetyError("無法辨識昨天回覆所在頁碼；為避免留下重複推文，停止操作。")
 
     if not today_posts:
         posted_new = True
@@ -883,15 +953,28 @@ def run_once(config: Config) -> dict[str, Any]:
         LOG.info("今天已有自己的回覆（%d 樓），不重複發布。", new_post.floor)
 
     if old_post is not None:
-        fresh = fetch_snapshot(session, config.target_url, config)
-        assert_owner_login(fresh, config)
+        latest = fetch_snapshot(session, config.target_url, config)
+        assert_owner_login(latest, config)
         persist_session_cookies(session, config)
-        fresh_today, _ = classify_daily_posts(fresh, config, datetime.now(config.timezone))
+        fresh_today, _ = classify_daily_posts(latest, config, datetime.now(config.timezone))
         if len(fresh_today) != 1:
             raise SafetyError("刪文前無法確認今天恰有一則自己的回覆；不刪舊文。")
+        delete_source = latest
+        if not any(post.post_id == old_post.post_id for post in latest.posts):
+            delete_source = fetch_page_snapshot(
+                session, config.target_url, old_post_page, config
+            )
+            assert_owner_login(delete_source, config)
+            persist_session_cookies(session, config)
         LOG.info("準備刪除昨天的 %d 樓（%s）。", old_post.floor, old_post.post_id)
-        delete_post(session, fresh, old_post, config)
-        after_delete = fetch_snapshot(session, config.target_url, config)
+        delete_post(session, delete_source, old_post, config)
+        after_delete = fetch_page_snapshot(
+            session,
+            config.target_url,
+            old_post_page,
+            config,
+            allow_empty=True,
+        )
         assert_owner_login(after_delete, config)
         persist_session_cookies(session, config)
         if any(post.post_id == old_post.post_id for post in after_delete.posts):

@@ -1,16 +1,21 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from main import (
     ConfigurationError,
     Config,
     Post,
+    ThreadSnapshot,
     build_session,
     classify_daily_posts,
     console_help,
     execute_console_command,
+    fetch_page_snapshot,
+    fetch_snapshot,
     load_cookie_records,
     mobile_login,
     parse_delete_request,
@@ -18,9 +23,11 @@ from main import (
     parse_thread_snapshot,
     parse_wall_time,
     persist_session_cookies,
+    run_once,
     seconds_until,
     validate_forum_url,
     with_last_page,
+    with_page,
 )
 
 
@@ -49,6 +56,32 @@ function pdel(sn) {
  delPost(sn, args, '5432');
 }
 </script>
+</body></html>
+"""
+
+LAST_PAGE = r"""
+<html><body>
+<section class="c-section" id="post_1114060">
+  <a class="floor" data-floor="21">21 樓</a>
+  <a class="userid">sangege01</a>
+  <span class="edittime" data-mtime="2026-09-06 20:30:00"></span>
+  <article>推</article>
+  <button class="tippy-option-menu" data-tippy='{"author":"sangege01","owner":true,"isLogin":true}'></button>
+</section>
+<form name="frm" action="post2.php?bsn=18673&amp;all=0&amp;snA=205415">
+  <input name="code" value="">
+  <input name="threadSubbsn" value="18">
+</form>
+<p class="BH-pagebtnA"><a href="?page=1&amp;bsn=18673&amp;snA=205415">1</a><a class="pagenow">2</a></p>
+</body></html>
+"""
+
+EMPTY_OLD_PAGE = r"""
+<html><body>
+<form name="frm" action="post2.php?bsn=18673&amp;all=0&amp;snA=205415">
+  <input name="threadSubbsn" value="18">
+</form>
+<p class="BH-pagebtnA"><a class="pagenow">137</a></p>
 </body></html>
 """
 
@@ -95,8 +128,11 @@ class MainTests(unittest.TestCase):
         self.assertEqual(validate_forum_url(self.url + "&page=99"), self.url)
         self.assertEqual(with_last_page(self.url), expected)
         self.assertEqual(with_last_page(expected), expected)
+        self.assertEqual(with_page(self.url, 137), self.url + "&page=137")
         with self.assertRaises(Exception):
             validate_forum_url("https://example.com/C.php?bsn=1&snA=2")
+        with self.assertRaises(ValueError):
+            with_page(self.url, 0)
 
     def test_time_helpers(self):
         self.assertEqual(parse_wall_time("20:30").hour, 20)
@@ -125,11 +161,107 @@ class MainTests(unittest.TestCase):
         )
         self.assertTrue(snapshot.owner_verified)
         self.assertTrue(snapshot.site_reports_login)
+        self.assertEqual(snapshot.page_number, 1)
         self.assertEqual(snapshot.subboard, "18")
         self.assertEqual(len(snapshot.posts), 2)
         self.assertEqual(snapshot.posts[1].post_id, "1113614")
         self.assertEqual(snapshot.posts[1].posted_at.second, 59)
         self.assertIn("post2.php", snapshot.form_action)
+
+    def test_fetch_snapshot_uses_page_one_for_owner_proof_after_floor_twenty(self):
+        with patch(
+            "main.request_page",
+            side_effect=[
+                (LAST_PAGE, self.url + "&page=2"),
+                (PAGE, self.url),
+            ],
+        ) as request:
+            snapshot = fetch_snapshot(object(), self.url, self.config())
+
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[0].args[1], with_last_page(self.url))
+        self.assertEqual(request.call_args_list[1].args[1], self.url)
+        self.assertTrue(snapshot.owner_verified)
+        self.assertTrue(snapshot.site_reports_login)
+        self.assertEqual(snapshot.page_number, 2)
+        self.assertEqual([post.floor for post in snapshot.posts], [21])
+        self.assertIn("post2.php", snapshot.form_action)
+
+    def test_run_once_deletes_previous_reply_across_any_page_boundary(self):
+        now = datetime.now(self.tz)
+        yesterday = datetime.combine(
+            now.date() - timedelta(days=1), parse_wall_time("20:30"), tzinfo=self.tz
+        )
+        today = datetime.combine(now.date(), parse_wall_time("20:30"), tzinfo=self.tz)
+
+        def snapshot(posts, page):
+            return ThreadSnapshot(
+                url=self.url,
+                html_text=PAGE,
+                posts=tuple(posts),
+                form_action="https://forum.gamer.com.tw/post2.php",
+                form_fields={"threadSubbsn": "18"},
+                subboard="18",
+                owner_verified=True,
+                site_reports_login=True,
+                page_number=page,
+            )
+
+        for old_page in (2, 137):
+            with self.subTest(old_page=old_page):
+                old_post = Post(str(old_page * 20), old_page * 20, "sangege01", yesterday, "推")
+                new_post = Post(
+                    str(old_page * 20 + 1),
+                    old_page * 20 + 1,
+                    "sangege01",
+                    today,
+                    "推",
+                )
+                before = snapshot([old_post], old_page)
+                latest = snapshot([new_post], old_page + 1)
+                delete_source = snapshot([old_post], old_page)
+                after_delete = snapshot([], old_page)
+                config = replace(self.config(), auto_mobile_login=False)
+                session = object()
+
+                with (
+                    patch("main.build_session", return_value=session),
+                    patch("main.fetch_snapshot", side_effect=[before, latest, latest]),
+                    patch(
+                        "main.fetch_page_snapshot",
+                        side_effect=[delete_source, after_delete],
+                    ) as fetch_page,
+                    patch("main.post_reply"),
+                    patch("main.delete_post") as delete,
+                    patch("main.persist_session_cookies"),
+                    patch("main.notify_cookie_expiry"),
+                    patch("main.write_status"),
+                    patch("main.notify_daily_success"),
+                ):
+                    result = run_once(config)
+
+                self.assertTrue(result["posted_new"])
+                self.assertEqual([call.args[2] for call in fetch_page.call_args_list], [old_page, old_page])
+                self.assertTrue(fetch_page.call_args_list[1].kwargs["allow_empty"])
+                self.assertIs(delete.call_args.args[1], delete_source)
+                self.assertEqual(delete.call_args.args[2], old_post)
+
+    def test_empty_old_page_can_be_verified_after_deletion(self):
+        with patch(
+            "main.request_page",
+            side_effect=[
+                (EMPTY_OLD_PAGE, self.url + "&page=137"),
+                (PAGE, self.url),
+            ],
+        ):
+            snapshot = fetch_page_snapshot(
+                object(), self.url, 137, self.config(), allow_empty=True
+            )
+
+        self.assertEqual(snapshot.posts, ())
+        self.assertEqual(snapshot.page_number, 137)
+        self.assertTrue(snapshot.owner_verified)
+        self.assertTrue(snapshot.site_reports_login)
 
     def test_reply_owner_is_not_enough_to_prove_thread_ownership(self):
         page = PAGE.replace(
