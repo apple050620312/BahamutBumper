@@ -2,8 +2,8 @@
 
 這是放進一般 Pterodactyl **Python Generic Egg** 就能執行的常駐程式，不需要 Chromium、Playwright 或自訂 Docker image。它使用匯出的巴哈 Cookie，以普通 HTTPS 請求完成：
 
-1. 每天台北時間 `20:30` 先以 password-only mobile API 取得新的登入 Cookie。
-2. 驗證 API 與論壇帳號都是 `sangege01`。
+1. 每天台北時間 `20:30` 優先以 password-only mobile API 取得新的登入 Cookie；端點無法使用時，改以現有 Cookie 唯讀驗證論壇登入。
+2. 驗證登入帳號與文章擁有者都是 `sangege01`，而且有快速回覆表單，才進行後續操作。
 3. 當天尚未自推才回覆「推」。
 4. 重新讀取文章，唯一驗證新樓層存在。
 5. 再讀一次最新頁面與刪文 token，刪除今天以前最近一則自己的自推回覆；即使前一天流程失敗，也能清掉更早留下的舊推文。
@@ -58,11 +58,11 @@ python -m pip install --user -r requirements.txt && python main.py
 
 程式直接讀取 Pterodactyl Variables，不會自行讀 `.env`。必要變數的預設值已列在 `.env.example`；建議至少明確設定 `BAHAMUT_ACCOUNT`、`BAHAMUT_TARGET_URL`、`BUMP_TIME`。
 
-伺服器必須允許 DNS 與對 `https://forum.gamer.com.tw` 的連出 HTTPS。
+伺服器必須允許 DNS 與對 `https://forum.gamer.com.tw` 的連出 HTTPS；使用 mobile API 登入時也必須能連到 `https://api.gamer.com.tw`。
 
 ## Cookie 從零設定
 
-不要把巴哈帳號密碼交給腳本，也不要放進環境變數。先在自己的瀏覽器登入巴哈，再用可信任的 Cookie 匯出工具，只匯出 `gamer.com.tw` 網域 Cookie。
+若只使用匯出的 Cookie，請設 `AUTO_MOBILE_LOGIN=false`，不需要提供密碼。先在自己的瀏覽器登入巴哈，再用可信任的 Cookie 匯出工具，只匯出 `gamer.com.tw` 網域 Cookie。需要自動帳密登入時，依下一節設定本機密碼檔，不要把密碼放進環境變數。
 
 腳本接受三種 `data/cookies.json` 格式：
 
@@ -84,7 +84,11 @@ data/bahamut_password.txt
 
 不要把密碼貼到 Console、Discord、聊天或 Git。`data/` 已被 `.gitignore` 排除；Linux 上建議將檔案權限設為 `600`。主機管理員仍可能讀取容器檔案，請只在你信任的 Pterodactyl 主機使用。
 
-每天正式流程、`check`、`once` 都會先嘗試一次 mobile API 登入。它只使用帳號、密碼及 API 所需的配對 `vcode`，不處理或規避 reCAPTCHA。若 API 要求人機、新裝置、E-mail 或其他驗證，流程停止並透過 Discord @ 你。
+每天正式流程、`check`、`once` 都會先嘗試一次 mobile API 登入。它只使用帳號、密碼及 API 所需的配對 `vcode`，不處理或規避 reCAPTCHA。若 API 無法連線或回傳 HTTP 錯誤，會嘗試讀取現有 Cookie；只有論壇明確確認登入帳號、首篇擁有權與快速回覆表單都正確，才繼續流程並保存論壇更新的 Cookie。失效、錯誤帳號或未通過驗證的 Cookie 不會被覆寫，也不會發文或刪文。
+
+HTTP `403` 表示登入端點拒絕存取，可能與主機出口 IP、存取限制或額外驗證有關，僅憑狀態碼無法判定密碼錯誤。錯誤訊息會保留 HTTP 狀態碼；若回應帶有 Cloudflare 人機驗證標記或 Ray ID，也會一併顯示，不會列印回應內文、密碼或 Cookie。若現有 Cookie 也無法驗證，`403`、`429` 等不可立即重試的登入錯誤會通知失敗並停止當天剩餘重試，隔天仍會重新嘗試；連線逾時與伺服器 `5xx` 錯誤則保留排程重試。
+
+若 API 以正常回應明確拒絕帳密、登入帳號不符或要求人機／新裝置驗證，流程直接停止，不改用舊 Cookie。排程會透過 Discord @ 你；`check` 與 `login-test` 的結果顯示於 Console。
 
 可在 Pterodactyl Console 單獨測試，不會發文或刪文：
 
@@ -92,7 +96,7 @@ data/bahamut_password.txt
 login-test
 ```
 
-成功後會看到 `forum_owner_verified: true` 與 `cookie_saved: true`。同一 Console 指令五分鐘內只允許嘗試一次；production 排程則仍受 `MAX_RETRIES` 限制。
+成功後會看到 `forum_owner_verified: true` 與 `cookie_saved: true`。`login-test` 只測試 API，不會改用現有 Cookie；同一 Console 指令五分鐘內只允許嘗試一次。production 排程最多嘗試 `MAX_RETRIES` 次，但需要人工處理的登入拒絕會提早停止。
 
 啟動伺服器後，直接在 Pterodactyl Console 輸入只讀指令（不要加 `python main.py`）：
 
@@ -101,6 +105,12 @@ check
 ```
 
 成功時會看到 `"ok": true`、`"owner_verified": true`、`"reply_form": true`。這一步會建立登入 session 並更新 Cookie，但不發文、不刪文。
+
+### Coffeehost 出現連續 HTTP 403
+
+更新 `main.py` 並重啟後，在 Pterodactyl Console 輸入 `check`。若看到現有 Cookie 通過論壇驗證且 `"ok": true`，後續排程就能使用這個已驗證的登入狀態。若 Cookie 缺失或失效，請在瀏覽器重新登入並匯出至 `data/cookies.json`（或自訂的 `BAHAMUT_COOKIE_FILE`），再輸入 `check`。瀏覽器匯出的 Cookie 仍須通過容器端驗證。
+
+若容器仍被拒絕，請主機商檢查 Coffeehost 的出口 IP 與巴哈存取限制，並提供錯誤中的 HTTP 狀態碼與 Cloudflare Ray ID（若有）。單純增加 `MAX_RETRIES` 無法解除存取限制。確認只靠論壇 Cookie 能正常運作後，可設 `AUTO_MOBILE_LOGIN=false` 暫停 mobile API 登入。
 
 ## 安全測試順序
 
@@ -169,9 +179,10 @@ test-notification
 
 - **Cookie 過期、錯誤帳號或無權回覆**：停止，不發文；重新登入並匯出 Cookie。
 - **mobile API 登入成功**：先驗證 API 帳號及論壇樓主，再保存新 Cookie 並繼續每日流程。
+- **mobile API HTTP 403／429 或暫時無法連線**：先驗證現有論壇 Cookie；通過才繼續，失敗則保留原 Cookie。403／429 不會在當天反覆自動登入。
 - **mobile API 要求額外驗證**：停止且 Discord @；不嘗試繞過 reCAPTCHA。
 - **網站主動續期 Cookie**：自動保存到原 Cookie 檔，不需人工處理。
-- **CAPTCHA／Cloudflare 人機驗證**：停止，不繞過；用瀏覽器人工處理後更新 Cookie。
+- **論壇頁面要求 CAPTCHA／Cloudflare 人機驗證**：停止，不繞過；用瀏覽器人工處理後更新 Cookie。
 - **送出時斷線，結果不明**：不刪舊文。常駐模式稍後重試時會先重讀文章；若今日回覆已存在便不會重複發。
 - **新回覆無法唯一驗證**：停止且不刪舊文。
 - **昨天是一般對話而不是推文**：只有內容完全等於 `BAHAMUT_DELETE_MESSAGES` 其中一項才可能刪除；預設 `推,eee` 是為了接手目前既有的 `eee`，之後可改成只留 `推`。
@@ -198,7 +209,7 @@ test-notification
 | `BUMP_TIME` | `20:30` | `TZ` 時區的每日時間 |
 | `TZ` | `Asia/Taipei` | 日界線與排程時區 |
 | `BAHAMUT_COOKIE_FILE` | `data/cookies.json` | Cookie 檔位置 |
-| `AUTO_MOBILE_LOGIN` | `true` | 每次正式／檢查流程前先重新登入取得 Cookie |
+| `AUTO_MOBILE_LOGIN` | `true` | 優先以帳密更新 Cookie；API 無法使用時驗證現有論壇 Cookie；設 `false` 則僅使用現有 Cookie |
 | `BAHAMUT_PASSWORD_FILE` | `data/bahamut_password.txt` | 只含巴哈密碼的 Git 忽略檔 |
 | `BAHAMUT_DELETE_MESSAGES` | `推,eee` | 允許刪除的昨日回覆文字 |
 | `BAHAMUT_GUARD_URLS` | 空白 | 其他本人伺服招生文，逗號分隔 |

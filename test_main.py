@@ -3,13 +3,19 @@ import unittest
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import requests
 
 from main import (
+    AuthenticationError,
     ConfigurationError,
     Config,
+    MobileLoginUnavailable,
     Post,
+    SafetyError,
     ThreadSnapshot,
+    authenticated_forum_snapshot,
     build_session,
     classify_daily_posts,
     console_help,
@@ -23,6 +29,8 @@ from main import (
     parse_thread_snapshot,
     parse_wall_time,
     persist_session_cookies,
+    run_check,
+    run_daemon,
     run_once,
     seconds_until,
     validate_forum_url,
@@ -151,6 +159,268 @@ class MainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ConfigurationError):
                 mobile_login(self.config(Path(directory)))
+
+    def mobile_response(self, status, body, headers=None):
+        response = requests.Response()
+        response.status_code = status
+        response._content = body.encode("utf-8")
+        response.encoding = "utf-8"
+        response.headers.update(headers or {})
+        mobile = Mock(headers={}, cookies=requests.cookies.RequestsCookieJar())
+        mobile.post.return_value = response
+        return mobile
+
+    def test_mobile_http_failures_preserve_status_without_exposing_response_secrets(self):
+        for status, retryable, mitigation in (
+            (403, False, ""),
+            (403, False, "challenge"),
+            (429, False, ""),
+            (503, True, ""),
+        ):
+            with (
+                self.subTest(status=status, mitigation=mitigation),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                config = self.config(Path(directory))
+                config.cookie_file.write_text("Cookie: saved=original", encoding="utf-8")
+                mobile = self.mobile_response(
+                    status,
+                    "<html>captcha test-password secret-cookie</html>",
+                    {"cf-mitigated": mitigation, "cf-ray": "123abc-TPE"},
+                )
+                with (
+                    patch("main.read_secret_file", return_value="test-password"),
+                    patch("requests.Session", return_value=mobile),
+                    patch("main.new_forum_session") as forum,
+                    self.assertRaises(MobileLoginUnavailable) as caught,
+                ):
+                    mobile_login(config)
+
+                error = str(caught.exception)
+                self.assertIn(f"HTTP {status}", error)
+                self.assertIn("123abc-TPE", error)
+                self.assertNotIn("test-password", error)
+                self.assertNotIn("secret-cookie", error)
+                self.assertEqual(caught.exception.retryable, retryable)
+                if status == 403:
+                    self.assertIn("人機驗證" if mitigation else "主機出口 IP", error)
+                self.assertEqual(config.cookie_file.read_text(), "Cookie: saved=original")
+                forum.assert_not_called()
+
+    def test_mobile_connection_failures_allow_cached_cookie_fallback_and_retry(self):
+        for error in (requests.Timeout(), requests.ConnectionError()):
+            with self.subTest(error=type(error).__name__):
+                mobile = self.mobile_response(200, "{}")
+                mobile.post.side_effect = error
+                with (
+                    patch("main.read_secret_file", return_value="test-password"),
+                    patch("requests.Session", return_value=mobile),
+                    self.assertRaises(MobileLoginUnavailable) as caught,
+                ):
+                    mobile_login(self.config())
+                self.assertTrue(caught.exception.retryable)
+                self.assertIn(type(error).__name__, str(caught.exception))
+
+    def test_rejected_credentials_and_explicit_challenges_do_not_use_cached_cookies(self):
+        for body in (
+            '{"message":"wrong password"}',
+            '{"userid":"another-account"}',
+            "<html>recaptcha</html>",
+        ):
+            with self.subTest(body=body):
+                mobile = self.mobile_response(200, body)
+                mobile.cookies.set("BAHARUNE", "test-rune", domain=".gamer.com.tw")
+                with (
+                    patch("main.read_secret_file", return_value="test-password"),
+                    patch("requests.Session", return_value=mobile),
+                    patch("main.build_session") as cached,
+                    self.assertRaises(AuthenticationError) as caught,
+                ):
+                    authenticated_forum_snapshot(self.config(), self.url)
+                self.assertNotIsInstance(caught.exception, MobileLoginUnavailable)
+                self.assertFalse(caught.exception.retryable)
+                cached.assert_not_called()
+
+    def test_mobile_login_still_saves_cookies_only_after_forum_owner_proof(self):
+        for owner in (True, False):
+            with self.subTest(owner=owner), tempfile.TemporaryDirectory() as directory:
+                config = self.config(Path(directory))
+                config.cookie_file.write_text("Cookie: saved=original", encoding="utf-8")
+                forum = requests.Session()
+                mobile = self.mobile_response(200, '{"userid":"sangege01"}')
+                mobile.cookies.set("BAHARUNE", "test-rune", domain=".gamer.com.tw")
+                snapshot = replace(
+                    parse_thread_snapshot(
+                        PAGE, self.url, config.account, datetime.now(self.tz)
+                    ),
+                    owner_verified=owner,
+                )
+                with (
+                    patch("main.read_secret_file", return_value="test-password"),
+                    patch("requests.Session", return_value=mobile),
+                    patch("main.new_forum_session", return_value=forum),
+                    patch("main.fetch_snapshot", return_value=snapshot),
+                ):
+                    if owner:
+                        result = mobile_login(config)
+                        self.assertTrue(result["forum_owner_verified"])
+                        self.assertTrue(result["cookie_saved"])
+                    else:
+                        with self.assertRaises(AuthenticationError):
+                            mobile_login(config)
+                if owner:
+                    self.assertIn(
+                        "BAHARUNE",
+                        {c["name"] for c in load_cookie_records(config.cookie_file)},
+                    )
+                else:
+                    self.assertEqual(config.cookie_file.read_text(), "Cookie: saved=original")
+                    self.assertFalse(config.cookie_file.with_suffix(".json.backup").exists())
+
+    def test_run_check_uses_verified_cached_cookies_on_api_outages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            config.cookie_file.write_text("Cookie: saved=original", encoding="utf-8")
+            snapshot = parse_thread_snapshot(
+                PAGE, self.url, config.account, datetime.now(self.tz)
+            )
+            for error in (
+                MobileLoginUnavailable("HTTP 403", retryable=False),
+                MobileLoginUnavailable("HTTP 503"),
+                MobileLoginUnavailable("Timeout"),
+            ):
+                with (
+                    self.subTest(error=str(error)),
+                    patch("main.mobile_login", side_effect=error),
+                    patch("main.fetch_snapshot", return_value=snapshot),
+                    patch("main.notify_cookie_expiry"),
+                    self.assertLogs("bahamut-bumper", level="WARNING") as logs,
+                ):
+                    result = run_check(config)
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["owner_verified"])
+                self.assertIn(str(error), " ".join(logs.output))
+                self.assertEqual(config.cookie_file.read_text(), "Cookie: saved=original")
+
+    def test_fallback_saves_cookie_rotations_after_verification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(Path(directory))
+            config.cookie_file.write_text("Cookie: saved=original", encoding="utf-8")
+            snapshot = parse_thread_snapshot(
+                PAGE, self.url, config.account, datetime.now(self.tz)
+            )
+
+            def rotated_snapshot(session, *_args):
+                session.cookies.set("rotated", "new", domain=".gamer.com.tw")
+                session._bahamut_cookie_dirty = True
+                return snapshot
+
+            with (
+                patch(
+                    "main.mobile_login",
+                    side_effect=MobileLoginUnavailable("HTTP 403", retryable=False),
+                ),
+                patch("main.fetch_snapshot", side_effect=rotated_snapshot),
+                self.assertLogs("bahamut-bumper", level="WARNING"),
+            ):
+                authenticated_forum_snapshot(config, self.url)
+            self.assertIn(
+                "rotated", {c["name"] for c in load_cookie_records(config.cookie_file)}
+            )
+            self.assertEqual(
+                config.cookie_file.with_suffix(".json.backup").read_text(),
+                "Cookie: saved=original",
+            )
+
+    def test_failed_cookie_fallback_preserves_403_and_prevents_forum_writes(self):
+        for state in ("missing", "logged-out", "wrong-account", "challenge"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                config = self.config(Path(directory))
+                if state != "missing":
+                    config.cookie_file.write_text("Cookie: saved=original", encoding="utf-8")
+                snapshot = replace(
+                    parse_thread_snapshot(
+                        PAGE, self.url, config.account, datetime.now(self.tz)
+                    ),
+                    owner_verified=False,
+                    site_reports_login=state == "wrong-account",
+                )
+
+                def rejected_snapshot(session, *_args):
+                    session.cookies.set("rotated", "unverified", domain=".gamer.com.tw")
+                    session._bahamut_cookie_dirty = True
+                    if state == "challenge":
+                        raise SafetyError("CAPTCHA")
+                    return snapshot
+
+                with (
+                    patch(
+                        "main.mobile_login",
+                        side_effect=MobileLoginUnavailable("HTTP 403", retryable=False),
+                    ),
+                    patch("main.fetch_snapshot", side_effect=rejected_snapshot),
+                    patch("main.post_reply") as post,
+                    patch("main.delete_post") as delete,
+                    self.assertLogs("bahamut-bumper", level="WARNING"),
+                    self.assertRaises(MobileLoginUnavailable) as caught,
+                ):
+                    run_once(config)
+                self.assertIn("HTTP 403", str(caught.exception))
+                self.assertFalse(caught.exception.retryable)
+                post.assert_not_called()
+                delete.assert_not_called()
+                if state == "missing":
+                    self.assertFalse(config.cookie_file.exists())
+                else:
+                    self.assertEqual(config.cookie_file.read_text(), "Cookie: saved=original")
+                self.assertFalse(config.cookie_file.with_suffix(".json.backup").exists())
+
+    def test_disabling_auto_mobile_login_uses_only_verified_forum_cookies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = replace(self.config(Path(directory)), auto_mobile_login=False)
+            config.cookie_file.write_text("Cookie: saved=original", encoding="utf-8")
+            snapshot = parse_thread_snapshot(
+                PAGE, self.url, config.account, datetime.now(self.tz)
+            )
+            with (
+                patch("main.mobile_login") as mobile,
+                patch("main.fetch_snapshot", return_value=snapshot),
+                patch("main.notify_cookie_expiry"),
+            ):
+                self.assertTrue(run_check(config)["ok"])
+            mobile.assert_not_called()
+
+    def test_daemon_stops_blocked_login_retries_but_retries_transient_failures(self):
+        for status, retryable, attempts in ((403, False, 1), (429, False, 1), (503, True, 3)):
+            with self.subTest(status=status):
+                config = replace(self.config(), bump_at=parse_wall_time("00:00"))
+
+                def stop_before_next_day(stop, _commands, seconds, _config):
+                    if seconds != config.retry_minutes * 60:
+                        stop[0] = True
+
+                with (
+                    patch("main.signal.signal"),
+                    patch("main.threading.Thread"),
+                    patch(
+                        "main.run_once",
+                        side_effect=MobileLoginUnavailable(
+                            f"HTTP {status}", retryable=retryable
+                        ),
+                    ) as run,
+                    patch(
+                        "main.next_scheduled_at",
+                        return_value=datetime.now(self.tz) + timedelta(days=1),
+                    ),
+                    patch("main.wait_with_console", side_effect=stop_before_next_day),
+                    patch("main.write_status") as write,
+                    patch("main.notify_failure") as notify,
+                    self.assertLogs("bahamut-bumper", level="INFO"),
+                ):
+                    run_daemon(config)
+                self.assertEqual(run.call_count, attempts)
+                self.assertEqual(write.call_args.args[1]["retryable"], retryable)
+                self.assertEqual(notify.call_count, attempts)
 
     def test_snapshot_parsing_and_owner_proof(self):
         snapshot = parse_thread_snapshot(

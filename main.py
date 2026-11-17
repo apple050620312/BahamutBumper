@@ -54,6 +54,14 @@ class ConfigurationError(RuntimeError):
 class AuthenticationError(RuntimeError):
     """The exported Bahamut login is absent, expired, or is the wrong user."""
 
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class MobileLoginUnavailable(AuthenticationError):
+    """The mobile endpoint is unavailable; a verified forum session may work."""
+
 
 class SafetyError(RuntimeError):
     """Page state is ambiguous, so a write operation must not continue."""
@@ -690,18 +698,37 @@ def mobile_login(
             data={"uid": config.account, "passwd": password, "vcode": "7045"},
             timeout=config.timeout_seconds,
         )
-        response.raise_for_status()
-    except Exception as exc:
-        raise AuthenticationError(
+    except requests.RequestException as exc:
+        raise MobileLoginUnavailable(
             f"mobile API 登入連線失敗（{type(exc).__name__}）。"
         ) from exc
+    if response.status_code >= 400:
+        detail = f"mobile API 登入請求失敗（HTTP {response.status_code}）。"
+        if response.status_code == 403:
+            if response.headers.get("cf-mitigated", "").casefold() == "challenge":
+                detail += "Cloudflare 要求人機驗證；腳本不會繞過。"
+            else:
+                detail += (
+                    "登入端點拒絕存取，可能是主機出口 IP／存取限制或額外驗證；"
+                    "不能據此判定密碼錯誤。"
+                )
+        elif response.status_code == 429:
+            detail += "登入端點限制請求頻率，停止本日自動重試。"
+        ray_id = response.headers.get("cf-ray", "")
+        if re.fullmatch(r"[A-Za-z0-9-]{1,100}", ray_id):
+            detail += f" Cloudflare Ray ID：{ray_id}。"
+        raise MobileLoginUnavailable(
+            detail,
+            retryable=response.status_code in {408, 425} or response.status_code >= 500,
+        )
     try:
         payload = response.json()
     except ValueError as exc:
         lower = response.text.casefold()
         if "recaptcha" in lower or "captcha" in lower or "驗證" in response.text:
             raise AuthenticationError(
-                "mobile API 要求額外的人機／新裝置驗證；腳本不會繞過。"
+                "mobile API 要求額外的人機／新裝置驗證；腳本不會繞過。",
+                retryable=False,
             ) from exc
         raise AuthenticationError("mobile API 未回傳 JSON 登入結果。") from exc
 
@@ -710,7 +737,9 @@ def mobile_login(
         (cookie.value for cookie in mobile.cookies if cookie.name == "BAHARUNE"), None
     )
     if userid.casefold() != config.account.casefold() or not rune:
-        raise AuthenticationError(f"mobile API 登入失敗：{_mobile_error_message(payload)}")
+        raise AuthenticationError(
+            f"mobile API 登入失敗：{_mobile_error_message(payload)}", retryable=False
+        )
 
     forum = new_forum_session()
     if config.cookie_file.is_file():
@@ -760,6 +789,37 @@ def refresh_login_for_production(config: Config) -> None:
         return
     LOG.info("使用 mobile API 更新本次流程的巴哈登入 Cookie。")
     mobile_login(config)
+
+
+def authenticated_forum_snapshot(
+    config: Config, target_url: str
+) -> tuple[Any, ThreadSnapshot]:
+    """Use cached cookies on API outages only after proving forum ownership."""
+    mobile_error: MobileLoginUnavailable | None = None
+    try:
+        refresh_login_for_production(config)
+    except MobileLoginUnavailable as exc:
+        mobile_error = exc
+        LOG.warning("%s 將唯讀驗證現有 Cookie 是否仍可登入論壇。", exc)
+
+    try:
+        session = build_session(config)
+        snapshot = fetch_snapshot(session, target_url, config)
+        assert_owner_login(snapshot, config)
+    except (AuthenticationError, ConfigurationError, SafetyError) as exc:
+        if mobile_error is None:
+            raise
+        raise MobileLoginUnavailable(
+            f"{mobile_error} 現有 Cookie 也無法通過論壇驗證：{exc} "
+            "請重新登入並匯出 Cookie 至 BAHAMUT_COOKIE_FILE；"
+            "若容器持續收到 HTTP 403，請主機商檢查出口 IP 與巴哈存取限制。",
+            retryable=mobile_error.retryable,
+        ) from exc
+
+    persist_session_cookies(session, config)
+    if mobile_error is not None:
+        LOG.warning("現有 Cookie 已通過論壇帳號與回覆表單驗證，繼續本次流程。")
+    return session, snapshot
 
 
 def own_posts(snapshot: ThreadSnapshot, account: str) -> list[Post]:
@@ -894,11 +954,7 @@ def verify_new_post(
 
 
 def run_check(config: Config) -> dict[str, Any]:
-    refresh_login_for_production(config)
-    session = build_session(config)
-    snapshot = fetch_snapshot(session, config.target_url, config)
-    assert_owner_login(snapshot, config)
-    persist_session_cookies(session, config)
+    session, snapshot = authenticated_forum_snapshot(config, config.target_url)
     notify_cookie_expiry(config)
     now = datetime.now(config.timezone)
     today_posts, previous_posts = classify_daily_posts(snapshot, config, now)
@@ -928,11 +984,7 @@ def run_check(config: Config) -> dict[str, Any]:
 
 
 def run_once(config: Config) -> dict[str, Any]:
-    refresh_login_for_production(config)
-    session = build_session(config)
-    snapshot = fetch_snapshot(session, config.target_url, config)
-    assert_owner_login(snapshot, config)
-    persist_session_cookies(session, config)
+    session, snapshot = authenticated_forum_snapshot(config, config.target_url)
     notify_cookie_expiry(config)
     now = datetime.now(config.timezone)
     today_posts, previous_posts = classify_daily_posts(snapshot, config, now)
@@ -1006,11 +1058,7 @@ def live_round_trip_test(config: Config, test_url: str) -> dict[str, Any]:
     test_url = validate_forum_url(test_url)
     if thread_identity(test_url) == thread_identity(config.target_url):
         raise SafetyError("即時測試禁止使用正式自推文章。")
-    refresh_login_for_production(config)
-    session = build_session(config)
-    snapshot = fetch_snapshot(session, test_url, config)
-    assert_owner_login(snapshot, config)
-    persist_session_cookies(session, config)
+    session, snapshot = authenticated_forum_snapshot(config, test_url)
     if snapshot.subboard is None:
         raise SafetyError("無法辨識測試文章分類；拒絕發文。")
     if snapshot.subboard == "18":
@@ -1429,23 +1477,30 @@ def run_daemon(config: Config) -> None:
                 run_once(config)
                 break
             except Exception as exc:
+                retryable = not isinstance(exc, AuthenticationError) or exc.retryable
                 failure = {
                     "ok": False,
                     "failed_at": datetime.now(config.timezone).isoformat(),
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                     "attempt": attempt,
+                    "retryable": retryable,
                 }
                 write_status(config, failure)
                 LOG.exception("每日流程失敗：%s", exc)
-                if isinstance(exc, AuthenticationError):
-                    notify_failure(config, exc, scope="每日流程")
                 final_failure = (
-                    attempt >= config.max_retries
+                    not retryable
+                    or attempt >= config.max_retries
                     or datetime.now(config.timezone).date() != run_date
                 )
-                if final_failure:
+                if isinstance(exc, AuthenticationError) or final_failure:
                     notify_failure(config, exc, scope="每日流程")
+                if final_failure:
+                    if not retryable:
+                        LOG.info(
+                            "登入遭拒或需要人工驗證，停止本日剩餘重試；"
+                            "輸入 check 可手動重新檢查。"
+                        )
                     break
                 wait_with_console(stop, commands, config.retry_minutes * 60, config)
                 if stop[0]:
