@@ -4,7 +4,7 @@
 
 ## 安裝
 
-使用 Python 3.11 以上。將 `main.py`、`bahamut_bumper/` 和 `requirements.txt` 上傳到伺服器根目錄，然後安裝依賴。
+使用 Python 3.11 以上。將 `main.py`、`bahamut_bumper/`、`requirements.txt` 和 `.env.example` 上傳到伺服器根目錄，然後安裝依賴。
 
 ```sh
 python -m pip install --user -r requirements.txt
@@ -13,12 +13,18 @@ python -m pip install --user -r requirements.txt
 Pterodactyl 的啟動指令設定為 `python main.py`。如果需要 ZIP，可從 Git 只封裝部署程式。
 
 ```sh
-git archive --format=zip --output=BahamutBumper.zip HEAD main.py bahamut_bumper requirements.txt
+git archive --format=zip --output=BahamutBumper.zip HEAD main.py bahamut_bumper requirements.txt .env.example
 ```
 
 ## 設定帳號
 
-將 Pterodactyl 環境變數 `BAHAMUT_ACCOUNTS_FILE` 設為 `data/accounts.json`。在該檔案填入帳號與文章網址，每組各填一篇。
+將伺服器根目錄的 `.env.example` 複製成 `.env`，與 `main.py` 放在一起。範例已填入以下帳號清單路徑。
+
+```dotenv
+BAHAMUT_ACCOUNTS_FILE=data/accounts.json
+```
+
+程式啟動時會讀取 `.env`，每行一個 `名稱=值`。若同一項也在啟動環境中設定，以啟動環境為準。在 `data/accounts.json` 填入帳號與文章網址，每組各填一篇。
 
 ```json
 [
@@ -65,15 +71,7 @@ git archive --format=zip --output=BahamutBumper.zip HEAD main.py bahamut_bumper 
 
 ## 常用設定
 
-| 環境變數 | 預設 |
-|---|---|
-| `BUMP_TIME` | `20:30` |
-| `TZ` | `Asia/Taipei` |
-| `BAHAMUT_MESSAGE` | `推` |
-| `BAHAMUT_DELETE_MESSAGES` | 回覆文字及 `eee`，以逗號分隔 |
-| `MAX_RETRIES` | `3` |
-| `RETRY_MINUTES` | `10` |
-| `RUN_MISSED_ON_START` | `true` |
+排程、回覆、重試和登入等完整設定都列在 [.env.example](.env.example)。
 
 需要 Discord 通知時，把 Webhook URL 放在 `data/discord_webhook.txt`，並設定 `DISCORD_ATTENTION_USER_ID` 指定失敗時要通知的帳號。可用 Console 的 `test-notification` 確認。
 

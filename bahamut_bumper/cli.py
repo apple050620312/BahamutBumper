@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Any
 
 from .auth import mobile_login
-from .config import AppConfig, select_account
+from .config import AppConfig, load_dotenv, select_account
 from .errors import AuthenticationError, ConfigurationError, SafetyError
 from .notifications import notify_failure, notify_login_test, test_notification
 from .scheduler import next_scheduled_at, run_check, run_daemon, run_once
@@ -169,13 +169,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
     args = build_parser().parse_args()
     failure_account = None
     try:
+        load_dotenv()
+        logging.basicConfig(
+            level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            format="%(asctime)s %(levelname)s %(message)s",
+        )
         config = AppConfig.from_env()
         config.data_dir.mkdir(parents=True, exist_ok=True)
         if args.status:

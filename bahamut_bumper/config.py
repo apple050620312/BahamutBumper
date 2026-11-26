@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, replace
 from datetime import datetime, time as wall_time
 from pathlib import Path
@@ -16,6 +17,40 @@ from .forum import validate_forum_url
 
 
 DEFAULT_URL = "https://forum.gamer.com.tw/C.php?bsn=18673&snA=205415"
+DOTENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+DOTENV_QUOTED_VALUE = re.compile(r"""(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?""")
+
+
+def load_dotenv(path: Path = Path(".env")) -> None:
+    """Load literal KEY=value settings without replacing startup variables."""
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except FileNotFoundError:
+        return
+
+    settings = {}
+    for number, line in enumerate(lines, start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, raw_value = line.removeprefix("export ").partition("=")
+        key = key.strip()
+        error = f"{path} 第 {number} 行格式錯誤，請使用 名稱=值。"
+        if not separator or not DOTENV_KEY.fullmatch(key):
+            raise ConfigurationError(error)
+
+        value = raw_value.strip()
+        if value.startswith(('"', "'")):
+            quoted = DOTENV_QUOTED_VALUE.fullmatch(value)
+            if quoted is None:
+                raise ConfigurationError(error)
+            value = next(group for group in quoted.groups() if group is not None)
+        else:
+            value = re.split(r"\s+#", raw_value, maxsplit=1)[0].strip()
+        settings[key] = value
+
+    for key, value in settings.items():
+        os.environ.setdefault(key, value)
 
 
 @dataclass(frozen=True)
