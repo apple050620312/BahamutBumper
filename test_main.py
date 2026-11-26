@@ -1,3 +1,5 @@
+import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
@@ -22,6 +24,7 @@ from main import (
     execute_console_command,
     fetch_page_snapshot,
     fetch_snapshot,
+    live_round_trip_test,
     load_cookie_records,
     mobile_login,
     parse_delete_request,
@@ -98,6 +101,7 @@ class MainTests(unittest.TestCase):
     def setUp(self):
         self.tz = timezone(timedelta(hours=8), "Asia/Taipei")
         self.url = "https://forum.gamer.com.tw/C.php?bsn=18673&snA=205415"
+        self.other_url = "https://forum.gamer.com.tw/C.php?bsn=60&snA=12345"
 
     def config(self, root: Path = Path(".")) -> Config:
         return Config(
@@ -119,6 +123,157 @@ class MainTests(unittest.TestCase):
             password_file=root / "bahamut_password.txt",
             auto_mobile_login=True,
         )
+
+    def config_from_accounts_file(self, root, accounts):
+        path = root / "accounts.json"
+        path.write_text(json.dumps(accounts), encoding="utf-8")
+        with patch.dict(
+            os.environ,
+            {"DATA_DIR": str(root), "BAHAMUT_ACCOUNTS_FILE": str(path)},
+            clear=True,
+        ):
+            return Config.from_env()
+
+    def test_accounts_file_requires_unique_accounts_threads_and_cookies(self):
+        first = {"account": "sangege01", "target_url": self.url, "cookie_file": "first.json"}
+        second = {"account": "other", "target_url": self.other_url, "cookie_file": "second.json"}
+        for field, value in (
+            ("account", "SANGEGE01"),
+            ("target_url", self.url + "&page=2"),
+            ("target_url", self.url.replace("bsn=18673", "bsn=018673")),
+            ("target_url", self.other_url + "&snA=123456"),
+            ("cookie_file", "./first.json"),
+            ("cookie_file", "first.json.backup"),
+        ):
+            with (
+                self.subTest(field=field, value=value),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                with self.assertRaises(ConfigurationError):
+                    self.config_from_accounts_file(
+                        Path(directory), [first, {**second, field: value}]
+                    )
+
+    def test_run_once_uses_each_accounts_cookie_for_its_article(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config_from_accounts_file(
+                root,
+                [
+                    {
+                        "account": "sangege01",
+                        "target_url": self.url,
+                        "cookie_file": "cookies.json",
+                        "auto_mobile_login": False,
+                    },
+                    {
+                        "account": "other",
+                        "target_url": self.other_url,
+                        "cookie_file": "other.json",
+                        "auto_mobile_login": False,
+                    },
+                ],
+            )
+            (root / "cookies.json").write_text("Cookie: profile=first", encoding="utf-8")
+            (root / "other.json").write_text("Cookie: profile=second", encoding="utf-8")
+            now = datetime(2026, 11, 27, 20, 30, tzinfo=self.tz)
+            threads = {}
+            for url, account, cookie in (
+                (self.url, "sangege01", "first"),
+                (self.other_url, "other", "second"),
+            ):
+                snapshot = parse_thread_snapshot(
+                    PAGE.replace("sangege01", account), url, account, now
+                )
+                threads[url] = (replace(snapshot, posts=snapshot.posts[:1]), cookie)
+            published = []
+
+            def fetch(session, url, profile):
+                snapshot, cookie = threads[url]
+                self.assertEqual(session.cookies.get("profile"), cookie)
+                if url in published:
+                    post = Post("999", 2, profile.account, now, "推")
+                    snapshot = replace(snapshot, posts=(*snapshot.posts, post))
+                return snapshot
+
+            def publish(_session, snapshot, _message, _config):
+                published.append(snapshot.url)
+
+            with (
+                patch("main.datetime", wraps=datetime) as clock,
+                patch("main.mobile_login", side_effect=AssertionError("unexpected login")),
+                patch("main.fetch_snapshot", side_effect=fetch),
+                patch("main.post_reply", side_effect=publish),
+            ):
+                clock.now.return_value = now
+                checks = run_check(config)
+                result = run_once(config)
+
+            self.assertTrue(checks["ok"])
+            self.assertEqual(published, [self.url, self.other_url])
+            self.assertEqual(
+                [(item["account"], item["target"]) for item in result["results"]],
+                [("sangege01", self.url), ("other", self.other_url)],
+            )
+            self.assertEqual(
+                json.loads((root / "status.json").read_text(encoding="utf-8")), result
+            )
+
+    def test_daemon_only_retries_account_with_transient_login_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.config_from_accounts_file(
+                root,
+                [
+                    {"account": "sangege01", "target_url": self.url},
+                    {"account": "other", "target_url": self.other_url},
+                ],
+            )
+            config = replace(config, bump_at=parse_wall_time("00:00"))
+            calls = []
+
+            def attempt(profile):
+                calls.append(profile.account)
+                if profile.account == "sangege01":
+                    raise MobileLoginUnavailable("HTTP 403", retryable=False)
+                if calls.count("other") == 1:
+                    raise MobileLoginUnavailable("HTTP 503")
+                return {"ok": True, "posted_new": True}
+
+            def stop_before_next_day(stop, _commands, seconds, _config):
+                if seconds != config.retry_minutes * 60:
+                    stop[0] = True
+
+            with (
+                patch("main.signal.signal"),
+                patch("main.threading.Thread"),
+                patch("main.run_once", side_effect=attempt),
+                patch(
+                    "main.next_scheduled_at", return_value=datetime.now(self.tz) + timedelta(days=1)
+                ),
+                patch("main.wait_with_console", side_effect=stop_before_next_day),
+                patch("main.notify_failure"),
+                self.assertLogs("bahamut-bumper", level="INFO"),
+            ):
+                run_daemon(config)
+
+            self.assertEqual(calls, ["sangege01", "other", "other"])
+            result = json.loads((root / "status.json").read_text(encoding="utf-8"))
+            self.assertFalse(result["ok"])
+            self.assertEqual([item["ok"] for item in result["results"]], [False, True])
+            self.assertEqual(result["results"][0]["error"], "HTTP 403")
+
+    def test_live_test_rejects_article_scheduled_for_another_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config_from_accounts_file(
+                Path(directory),
+                [
+                    {"account": "sangege01", "target_url": self.url},
+                    {"account": "other", "target_url": self.other_url},
+                ],
+            )
+            with self.assertRaisesRegex(SafetyError, "禁止使用正式自推文章"):
+                live_round_trip_test(config, self.other_url + "&page=2", account="sangege01")
 
     def test_relative_and_absolute_timestamps(self):
         today = date(2026, 8, 28)
@@ -456,6 +611,13 @@ class MainTests(unittest.TestCase):
         self.assertEqual(snapshot.page_number, 2)
         self.assertEqual([post.floor for post in snapshot.posts], [21])
         self.assertIn("post2.php", snapshot.form_action)
+
+    def test_fetch_snapshot_rejects_redirect_to_another_thread(self):
+        with (
+            patch("main.request_page", return_value=(PAGE, self.other_url)),
+            self.assertRaises(SafetyError),
+        ):
+            fetch_snapshot(object(), self.url, self.config())
 
     def test_run_once_deletes_previous_reply_across_any_page_boundary(self):
         now = datetime.now(self.tz)

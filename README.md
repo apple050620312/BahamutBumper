@@ -3,7 +3,7 @@
 這是放進一般 Pterodactyl **Python Generic Egg** 就能執行的常駐程式，不需要 Chromium、Playwright 或自訂 Docker image。它使用匯出的巴哈 Cookie，以普通 HTTPS 請求完成：
 
 1. 每天台北時間 `20:30` 優先以 password-only mobile API 取得新的登入 Cookie；端點無法使用時，改以現有 Cookie 唯讀驗證論壇登入。
-2. 驗證登入帳號與文章擁有者都是 `sangege01`，而且有快速回覆表單，才進行後續操作。
+2. 逐組驗證登入帳號擁有綁定的文章，且頁面有快速回覆表單。
 3. 當天尚未自推才回覆「推」。
 4. 重新讀取文章，唯一驗證新樓層存在。
 5. 再讀一次最新頁面與刪文 token，刪除今天以前最近一則自己的自推回覆；即使前一天流程失敗，也能清掉更早留下的舊推文。
@@ -56,9 +56,38 @@ python main.py
 python -m pip install --user -r requirements.txt && python main.py
 ```
 
-程式直接讀取 Pterodactyl Variables，不會自行讀 `.env`。必要變數的預設值已列在 `.env.example`；建議至少明確設定 `BAHAMUT_ACCOUNT`、`BAHAMUT_TARGET_URL`、`BUMP_TIME`。
+程式直接讀取 Pterodactyl Variables，不會自行讀 `.env`。單帳號可用 `BAHAMUT_ACCOUNT` 和 `BAHAMUT_TARGET_URL` 設定。多帳號則指定下方的設定檔。
 
 伺服器必須允許 DNS 與對 `https://forum.gamer.com.tw` 的連出 HTTPS；使用 mobile API 登入時也必須能連到 `https://api.gamer.com.tw`。
+
+## 設定多帳號與文章
+
+將 `BAHAMUT_ACCOUNTS_FILE` 設為 `data/accounts.json`，在該檔案中為每個帳號填寫一篇自己的文章。兩個帳號需要兩篇不同的文章。
+
+```json
+[
+  {
+    "account": "alice123",
+    "target_url": "https://forum.gamer.com.tw/C.php?bsn=18673&snA=205415",
+    "auto_mobile_login": false
+  },
+  {
+    "account": "bob456",
+    "target_url": "https://forum.gamer.com.tw/C.php?bsn=60&snA=12345",
+    "auto_mobile_login": false
+  }
+]
+```
+
+上例使用瀏覽器匯出的 Cookie。把兩份檔案分別放在 `data/accounts/account-alice123/cookies.json` 與 `data/accounts/account-bob456/cookies.json`。若要用 mobile API 自動登入，可將該組的 `auto_mobile_login` 改成 `true` 並將該帳號的密碼檔 `bahamut_password.txt` 放到同一資料夾。省略 `auto_mobile_login` 時沿用 `AUTO_MOBILE_LOGIN`。
+
+可用 `cookie_file` 和 `password_file` 指定既有檔案，相對路徑從 `accounts.json` 所在的資料夾起算。例如第一組可填 `"cookie_file": "cookies.json"` 使用原本的 `data/cookies.json`。原本的 `BAHAMUT_GUARD_URLS` 可改填到對應帳號的 `guard_urls` 網址陣列。
+
+所有帳號在同一個 `BUMP_TIME` 依清單順序執行，共用 `BAHAMUT_MESSAGE` 和 `BAHAMUT_DELETE_MESSAGES`。各組用自己的 Cookie 或密碼驗證登入。若一組失敗，其餘組仍照常執行。重試時只會處理符合重試條件的失敗帳號。
+
+在 Pterodactyl Console 輸入 `check` 檢查每組帳號與文章，`once` 立即執行所有組，`status` 查看各組的最近執行結果。只測試一組 mobile API 登入時可輸入 `login-test <帳號>`。執行即時發文測試時，在既有 `live-test <URL> CONFIRM` 指令後加上帳號。
+
+留空 `BAHAMUT_ACCOUNTS_FILE` 即可使用原本的單帳號環境變數。
 
 ## Cookie 從零設定
 
@@ -104,7 +133,7 @@ login-test
 check
 ```
 
-成功時會看到 `"ok": true`、`"owner_verified": true`、`"reply_form": true`。這一步會建立登入 session 並更新 Cookie，但不發文、不刪文。
+成功時會看到 `"ok": true`、`"owner_verified": true`、`"reply_form": true`。多帳號模式會在 `results` 列出各組結果。這一步會建立登入 session 並更新 Cookie，但不發文、不刪文。
 
 ### Coffeehost 出現連續 HTTP 403
 
@@ -198,7 +227,7 @@ test-notification
 - mobile API 不是巴哈承諾穩定的公開介面；端點、欄位或驗證政策改變時會安全停止。
 - 直接 HTTP 可能被網站新增的人機驗證阻擋，程式不會規避。
 - Cookie 會過期，且 `--check` 通過只代表讀取、登入與表單解析正常；要證明寫入及刪除必須跑一次 `--live-test`。
-- 程式只能檢查 `BAHAMUT_TARGET_URL` 與你列入 `BAHAMUT_GUARD_URLS` 的文章。若你另有伺服招生文卻沒列入，程式不知道同日是否已在別篇自推。
+- 程式會檢查每個帳號的目標文章及該帳號列入監控的文章。若同一帳號還有其他需監控的招生文章，請加入 `guard_urls`，或在單帳號模式使用 `BAHAMUT_GUARD_URLS`。
 - 目前規則雖不再強制刪舊推文，腳本仍依你的要求執行「先發今日、驗證後刪昨日」。刪除候選必須是本人、昨天、非首篇，且文字完全符合 `BAHAMUT_DELETE_MESSAGES`；多個候選時會停下，不會猜哪則該刪。
 - 被刪除的歷史回覆無法用板面資料完整重建，因此曝光估算不是保證。
 
@@ -208,6 +237,7 @@ test-notification
 |---|---:|---|
 | `BUMP_TIME` | `20:30` | `TZ` 時區的每日時間 |
 | `TZ` | `Asia/Taipei` | 日界線與排程時區 |
+| `BAHAMUT_ACCOUNTS_FILE` | 空白 | 多帳號 JSON 設定檔路徑 |
 | `BAHAMUT_COOKIE_FILE` | `data/cookies.json` | Cookie 檔位置 |
 | `AUTO_MOBILE_LOGIN` | `true` | 優先以帳密更新 Cookie；API 無法使用時驗證現有論壇 Cookie；設 `false` 則僅使用現有 Cookie |
 | `BAHAMUT_PASSWORD_FILE` | `data/bahamut_password.txt` | 只含巴哈密碼的 Git 忽略檔 |

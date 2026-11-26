@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Generic-Python Pterodactyl daemon for a daily Bahamut self-bump.
 
-The program uses ordinary HTTPS requests and an exported cookie file.  It
-publishes at most one reply per calendar day, verifies the new reply, and only
-then removes the previous day's reply.  Ambiguous states fail closed.
+The program uses ordinary HTTPS requests and exported cookies. Each account
+can publish one reply per day to its own configured thread. The previous
+reply is removed only after the current reply is confirmed.
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, time as wall_time, timedelta
 from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Any, Iterator
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from typing import Any, Callable, Iterator
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 
@@ -86,9 +86,11 @@ class Config:
     discord_user_id: str
     password_file: Path
     auto_mobile_login: bool
+    account_configs: tuple[Config, ...] = ()
 
     @classmethod
     def from_env(cls) -> "Config":
+        accounts_file = os.getenv("BAHAMUT_ACCOUNTS_FILE", "").strip()
         data_dir = Path(os.getenv("DATA_DIR", "data")).expanduser().resolve()
         cookie_file = Path(
             os.getenv("BAHAMUT_COOKIE_FILE", str(data_dir / "cookies.json"))
@@ -99,17 +101,19 @@ class Config:
         except Exception as exc:
             raise ConfigurationError(f"無效時區：{timezone_name}") from exc
 
-        target_url = validate_forum_url(
-            os.getenv("BAHAMUT_TARGET_URL", DEFAULT_URL).strip()
-        )
+        target_url = DEFAULT_URL
         guards: list[str] = []
-        for value in os.getenv("BAHAMUT_GUARD_URLS", "").split(","):
-            if value.strip():
-                guard = validate_forum_url(value.strip())
-                if thread_identity(guard) != thread_identity(target_url):
-                    guards.append(guard)
-
-        account = os.getenv("BAHAMUT_ACCOUNT", "sangege01").strip()
+        account = "sangege01"
+        if not accounts_file:
+            target_url = validate_forum_url(
+                os.getenv("BAHAMUT_TARGET_URL", DEFAULT_URL).strip()
+            )
+            for value in os.getenv("BAHAMUT_GUARD_URLS", "").split(","):
+                if value.strip():
+                    guard = validate_forum_url(value.strip())
+                    if guard != target_url:
+                        guards.append(guard)
+            account = os.getenv("BAHAMUT_ACCOUNT", account).strip()
         message = os.getenv("BAHAMUT_MESSAGE", "推").strip()
         if not account:
             raise ConfigurationError("BAHAMUT_ACCOUNT 不可為空白。")
@@ -128,7 +132,7 @@ class Config:
             )
         )
 
-        return cls(
+        config = cls(
             target_url=target_url,
             account=account,
             message=message,
@@ -155,6 +159,10 @@ class Config:
             ).expanduser().resolve(),
             auto_mobile_login=env_bool("AUTO_MOBILE_LOGIN", True),
         )
+        if accounts_file:
+            path = Path(accounts_file).expanduser().resolve()
+            config = replace(config, account_configs=load_account_configs(config, path))
+        return config
 
 
 @dataclass(frozen=True)
@@ -203,24 +211,114 @@ def parse_wall_time(value: str) -> wall_time:
 
 def validate_forum_url(url: str) -> str:
     parts = urlsplit(url)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    identifiers = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key in {"bsn", "snA"}
+    ]
+    query = dict(identifiers)
     if (
         parts.scheme != "https"
         or parts.hostname != FORUM_HOST
         or not parts.path.endswith("/C.php")
-        or not query.get("bsn", "").isdigit()
-        or not query.get("snA", "").isdigit()
+        or len(identifiers) != 2
+        or not re.fullmatch(r"[0-9]+", query.get("bsn", ""))
+        or not re.fullmatch(r"[0-9]+", query.get("snA", ""))
     ):
         raise ConfigurationError(
             "文章網址必須是 https://forum.gamer.com.tw/C.php 且包含數字 bsn、snA。"
         )
-    clean_query = {"bsn": query["bsn"], "snA": query["snA"]}
+    clean_query = {key: query[key].lstrip("0") or "0" for key in ("bsn", "snA")}
     return urlunsplit(("https", FORUM_HOST, "/C.php", urlencode(clean_query), ""))
 
 
 def thread_identity(url: str) -> tuple[str, str]:
     query = dict(parse_qsl(urlsplit(url).query))
     return query["bsn"], query["snA"]
+
+
+def _account_credential_path(
+    record: dict[str, Any], field: str, path: Path, default: Path
+) -> Path:
+    if field not in record:
+        return default.resolve()
+    value = record[field]
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigurationError(f"帳號設定的 {field} 必須是檔案路徑。")
+    return (path.parent / Path(value.strip()).expanduser()).resolve()
+
+
+def load_account_configs(base: Config, path: Path) -> tuple[Config, ...]:
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise ConfigurationError(f"無法讀取帳號設定檔 {path}，請確認檔案是有效的 JSON。") from exc
+    if not isinstance(entries, list) or not entries:
+        raise ConfigurationError("帳號設定檔必須是至少包含一組帳號與文章的 JSON 陣列。")
+
+    profiles: list[Config] = []
+    accounts: set[str] = set()
+    threads: set[str] = set()
+    account_dirs = {base.data_dir}
+    used_files = {path}
+    for number, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            raise ConfigurationError(f"第 {number} 組帳號設定必須是 JSON 物件。")
+        account = entry.get("account")
+        target = entry.get("target_url")
+        if not isinstance(account, str) or not account.strip() or not isinstance(target, str):
+            raise ConfigurationError(f"第 {number} 組必須填寫 account 和 target_url。")
+        account = account.strip()
+        account_key = account.casefold()
+        target_url = validate_forum_url(target.strip())
+        if account_key in accounts:
+            raise ConfigurationError(f"帳號 {account} 重複。每個帳號只能綁定一篇文章。")
+        if target_url in threads:
+            raise ConfigurationError(f"文章 {target_url} 重複。每篇文章只能綁定一個帳號。")
+
+        folder = "account-" + quote(account_key, safe="").replace(".", "%2E")
+        data_dir = (base.data_dir / "accounts" / folder).resolve()
+        if data_dir in account_dirs:
+            raise ConfigurationError(f"帳號 {account} 的資料夾與其他設定重複。")
+        cookie_file = _account_credential_path(
+            entry, "cookie_file", path, data_dir / "cookies.json"
+        )
+        password_file = _account_credential_path(
+            entry, "password_file", path, data_dir / "bahamut_password.txt"
+        )
+        files = {
+            cookie_file,
+            cookie_file.with_suffix(cookie_file.suffix + ".tmp"),
+            cookie_file.with_suffix(cookie_file.suffix + ".backup"),
+            password_file,
+        }
+        if len(files) != 4 or not files.isdisjoint(used_files):
+            raise ConfigurationError(f"帳號 {account} 的 Cookie 或密碼檔路徑重複。")
+
+        auto_mobile_login = entry.get("auto_mobile_login", base.auto_mobile_login)
+        if not isinstance(auto_mobile_login, bool):
+            raise ConfigurationError(f"帳號 {account} 的 auto_mobile_login 必須是 true 或 false。")
+        guards = entry.get("guard_urls", [])
+        if not isinstance(guards, list) or not all(isinstance(url, str) for url in guards):
+            raise ConfigurationError(f"帳號 {account} 的 guard_urls 必須是網址陣列。")
+        guard_urls = dict.fromkeys(validate_forum_url(url.strip()) for url in guards)
+        guard_urls.pop(target_url, None)
+
+        profiles.append(replace(
+            base,
+            account=account,
+            target_url=target_url,
+            data_dir=data_dir,
+            cookie_file=cookie_file,
+            password_file=password_file,
+            guard_urls=tuple(guard_urls),
+            auto_mobile_login=auto_mobile_login,
+        ))
+        accounts.add(account_key)
+        threads.add(target_url)
+        account_dirs.add(data_dir)
+        used_files.update(files)
+    return tuple(profiles)
 
 
 def with_last_page(url: str) -> str:
@@ -547,6 +645,15 @@ def parse_thread_snapshot(
     )
 
 
+def _assert_thread_url(thread_url: str, final_url: str) -> None:
+    try:
+        actual_url = validate_forum_url(final_url)
+    except (ConfigurationError, ValueError):
+        actual_url = None
+    if actual_url != validate_forum_url(thread_url):
+        raise SafetyError("巴哈回傳的頁面網址與目標文章不符，停止此篇操作。")
+
+
 def _fetch_snapshot_at(
     session: Any,
     thread_url: str,
@@ -556,6 +663,7 @@ def _fetch_snapshot_at(
     allow_empty: bool = False,
 ) -> ThreadSnapshot:
     page_text, final_url = request_page(session, request_url, config)
+    _assert_thread_url(thread_url, final_url)
     snapshot = parse_thread_snapshot(page_text, final_url, config.account, datetime.now(config.timezone))
     if not snapshot.posts and not allow_empty:
         raise SafetyError("頁面中找不到任何可解析樓層；可能是頁面結構已變更。")
@@ -565,6 +673,7 @@ def _fetch_snapshot_at(
         # authenticated account owns the thread. Fetch page 1 only for that
         # proof while preserving the final-page posts and reply form.
         first_text, first_url = request_page(session, thread_url, config)
+        _assert_thread_url(thread_url, first_url)
         first_page = parse_thread_snapshot(
             first_text, first_url, config.account, datetime.now(config.timezone)
         )
@@ -953,7 +1062,54 @@ def verify_new_post(
     return candidates[0]
 
 
+def _failure_status(config: Config, exc: Exception) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "failed_at": datetime.now(config.timezone).isoformat(),
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        "retryable": not isinstance(exc, AuthenticationError) or exc.retryable,
+    }
+
+
+def _account_summary(config: Config, results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    rows = [
+        {**results[profile.account], "account": profile.account, "target": profile.target_url}
+        for profile in config.account_configs
+        if profile.account in results
+    ]
+    return {
+        "ok": len(rows) == len(config.account_configs) and all(row["ok"] for row in rows),
+        "results": rows,
+    }
+
+
+def _run_accounts_once(
+    config: Config,
+    action: Callable[[Config], dict[str, Any]],
+    *,
+    save_status: bool = False,
+) -> dict[str, Any]:
+    results = {}
+    for profile in config.account_configs:
+        try:
+            results[profile.account] = action(profile)
+        except Exception as exc:
+            LOG.error("帳號 %s 執行失敗：%s", profile.account, exc)
+            failure = _failure_status(profile, exc)
+            results[profile.account] = failure
+            if save_status:
+                write_status(profile, failure)
+                notify_failure(profile, exc, scope="手動執行")
+    summary = _account_summary(config, results)
+    if save_status:
+        write_status(config, summary)
+    return summary
+
+
 def run_check(config: Config) -> dict[str, Any]:
+    if config.account_configs:
+        return _run_accounts_once(config, run_check)
     session, snapshot = authenticated_forum_snapshot(config, config.target_url)
     notify_cookie_expiry(config)
     now = datetime.now(config.timezone)
@@ -984,6 +1140,8 @@ def run_check(config: Config) -> dict[str, Any]:
 
 
 def run_once(config: Config) -> dict[str, Any]:
+    if config.account_configs:
+        return _run_accounts_once(config, run_once, save_status=True)
     session, snapshot = authenticated_forum_snapshot(config, config.target_url)
     notify_cookie_expiry(config)
     now = datetime.now(config.timezone)
@@ -1054,10 +1212,28 @@ def run_once(config: Config) -> dict[str, Any]:
     return result
 
 
-def live_round_trip_test(config: Config, test_url: str) -> dict[str, Any]:
+def _select_account(config: Config, account: str | None) -> Config:
+    profiles = config.account_configs or (config,)
+    if account is None:
+        if len(profiles) == 1:
+            return profiles[0]
+        raise ConfigurationError("請指定要使用的巴哈帳號。")
+    for profile in profiles:
+        if profile.account.casefold() == account.casefold():
+            return profile
+    raise ConfigurationError(f"找不到帳號設定：{account}")
+
+
+def live_round_trip_test(
+    config: Config, test_url: str, *, account: str | None = None
+) -> dict[str, Any]:
     test_url = validate_forum_url(test_url)
-    if thread_identity(test_url) == thread_identity(config.target_url):
+    if any(
+        thread_identity(test_url) == thread_identity(profile.target_url)
+        for profile in (config.account_configs or (config,))
+    ):
         raise SafetyError("即時測試禁止使用正式自推文章。")
+    config = _select_account(config, account)
     session, snapshot = authenticated_forum_snapshot(config, test_url)
     if snapshot.subboard is None:
         raise SafetyError("無法辨識測試文章分類；拒絕發文。")
@@ -1352,8 +1528,8 @@ def console_help() -> str:
         "  status                 顯示最近一次執行結果\n"
         "  next                   顯示下次排程時間\n"
         "  test-notification      發送不 @ 使用者的 Discord 測試通知\n"
-        "  login-test             只測試 mobile API 登入並更新 Cookie\n"
-        "  live-test <URL> CONFIRM 在自己的非伺服招生文章測試發文後刪除\n"
+        "  login-test [帳號]      測試指定帳號的 mobile API 登入並更新 Cookie\n"
+        "  live-test <URL> CONFIRM [帳號] 在指定帳號的非伺服招生文章測試發文再刪除\n"
         "  help                   顯示本說明\n"
         "  stop                   安全停止程式"
     )
@@ -1393,10 +1569,13 @@ def execute_console_command(line: str, config: Config) -> bool:
                 raise SafetyError("Discord 測試通知發送失敗。")
             print("Discord 測試通知已送出。", flush=True)
         elif command == "login-test":
+            if len(parts) > 2:
+                raise ConfigurationError("用法：login-test [帳號]")
+            profile = _select_account(config, parts[1] if len(parts) == 2 else None)
             print(
                 json.dumps(
                     mobile_login(
-                        config, enforce_rate_limit=True, notify_success=True
+                        profile, enforce_rate_limit=True, notify_success=True
                     ),
                     ensure_ascii=False,
                     indent=2,
@@ -1404,11 +1583,14 @@ def execute_console_command(line: str, config: Config) -> bool:
                 flush=True,
             )
         elif command == "live-test":
-            if len(parts) != 3 or parts[2] != "CONFIRM":
-                raise ConfigurationError("用法：live-test <URL> CONFIRM")
+            if len(parts) not in (3, 4) or parts[2] != "CONFIRM":
+                raise ConfigurationError("用法：live-test <URL> CONFIRM [帳號]")
+            account = parts[3] if len(parts) == 4 else None
             print(
                 json.dumps(
-                    live_round_trip_test(config, parts[1]), ensure_ascii=False, indent=2
+                    live_round_trip_test(config, parts[1], account=account),
+                    ensure_ascii=False,
+                    indent=2,
                 ),
                 flush=True,
             )
@@ -1471,40 +1653,47 @@ def run_daemon(config: Config) -> None:
                 break
         run_now = False
         run_date = datetime.now(config.timezone).date()
+        pending = config.account_configs or (config,)
+        results: dict[str, dict[str, Any]] = {}
         for attempt in range(1, config.max_retries + 1):
-            try:
-                LOG.info("開始每日流程（第 %d/%d 次嘗試）。", attempt, config.max_retries)
-                run_once(config)
-                break
-            except Exception as exc:
-                retryable = not isinstance(exc, AuthenticationError) or exc.retryable
-                failure = {
-                    "ok": False,
-                    "failed_at": datetime.now(config.timezone).isoformat(),
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                    "attempt": attempt,
-                    "retryable": retryable,
-                }
-                write_status(config, failure)
-                LOG.exception("每日流程失敗：%s", exc)
-                final_failure = (
-                    not retryable
-                    or attempt >= config.max_retries
-                    or datetime.now(config.timezone).date() != run_date
-                )
-                if isinstance(exc, AuthenticationError) or final_failure:
-                    notify_failure(config, exc, scope="每日流程")
-                if final_failure:
-                    if not retryable:
+            retry_accounts = []
+            for profile in pending:
+                if stop[0] or datetime.now(config.timezone).date() != run_date:
+                    break
+                try:
+                    LOG.info(
+                        "開始帳號 %s 的每日流程（第 %d/%d 次嘗試）。",
+                        profile.account,
+                        attempt,
+                        config.max_retries,
+                    )
+                    results[profile.account] = run_once(profile)
+                except Exception as exc:
+                    failure = _failure_status(profile, exc)
+                    failure["attempt"] = attempt
+                    results[profile.account] = failure
+                    write_status(profile, failure)
+                    LOG.exception("帳號 %s 的每日流程失敗：%s", profile.account, exc)
+                    final_failure = (
+                        not failure["retryable"]
+                        or attempt >= config.max_retries
+                        or datetime.now(config.timezone).date() != run_date
+                    )
+                    if isinstance(exc, AuthenticationError) or final_failure:
+                        notify_failure(profile, exc, scope="每日流程")
+                    if not final_failure:
+                        retry_accounts.append(profile)
+                    elif not failure["retryable"]:
                         LOG.info(
-                            "登入遭拒或需要人工驗證，停止本日剩餘重試；"
-                            "輸入 check 可手動重新檢查。"
+                            "帳號 %s 需要處理登入，停止該帳號本日剩餘重試。",
+                            profile.account,
                         )
-                    break
-                wait_with_console(stop, commands, config.retry_minutes * 60, config)
-                if stop[0]:
-                    break
+            if config.account_configs:
+                write_status(config, _account_summary(config, results))
+            if stop[0] or not retry_accounts or datetime.now(config.timezone).date() != run_date:
+                break
+            wait_with_console(stop, commands, config.retry_minutes * 60, config)
+            pending = tuple(retry_accounts)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1515,6 +1704,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--status", action="store_true", help="顯示最近一次執行紀錄")
     mode.add_argument("--test-notification", action="store_true", help="發送一則不標註使用者的 Discord 測試通知")
     mode.add_argument("--live-test", metavar="URL", help="在自己的非伺服招生文章測試發文後刪除")
+    parser.add_argument("--account", help="指定 --live-test 使用的巴哈帳號")
     parser.add_argument(
         "--confirm-live-test",
         action="store_true",
@@ -1538,7 +1728,10 @@ def main() -> int:
             return 0
         with process_lock(config.data_dir / "daemon.lock"):
             if args.check:
-                print(json.dumps(run_check(config), ensure_ascii=False, indent=2))
+                result = run_check(config)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                if not result["ok"]:
+                    return 2
             elif args.test_notification:
                 if _discord_webhook_url(config) is None:
                     raise ConfigurationError("尚未設定 Discord Webhook。")
@@ -1555,13 +1748,16 @@ def main() -> int:
                     )
                 print(
                     json.dumps(
-                        live_round_trip_test(config, args.live_test),
+                        live_round_trip_test(config, args.live_test, account=args.account),
                         ensure_ascii=False,
                         indent=2,
                     )
                 )
             elif args.once:
-                print(json.dumps(run_once(config), ensure_ascii=False, indent=2))
+                result = run_once(config)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                if not result["ok"]:
+                    return 2
             else:
                 run_daemon(config)
         return 0
