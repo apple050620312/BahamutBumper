@@ -72,7 +72,7 @@ def send_discord_notification(
     sent = _notification_state(config)
     if dedupe_key and dedupe_key in sent:
         return True
-    if attention:
+    if attention and config.discord_user_id:
         content = f"<@{config.discord_user_id}> {message}"
         allowed_mentions = {"users": [config.discord_user_id]}
     else:

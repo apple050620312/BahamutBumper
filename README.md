@@ -30,7 +30,7 @@ BAHAMUT_ACCOUNTS_FILE=data/accounts.json
 [
   {
     "account": "alice123",
-    "target_url": "https://forum.gamer.com.tw/C.php?bsn=18673&snA=205415"
+    "target_url": "https://forum.gamer.com.tw/C.php?bsn=100&snA=101"
   },
   {
     "account": "bob456",
@@ -46,7 +46,7 @@ BAHAMUT_ACCOUNTS_FILE=data/accounts.json
 
 程式先讀密碼登入，驗證成功後會自動保存該帳號的 `cookies.json`。發文和刪文都使用這個已驗證的登入。
 
-原本的單帳號部署可沿用 `BAHAMUT_ACCOUNT`、`BAHAMUT_TARGET_URL` 和 `data/bahamut_password.txt`。切換成帳號清單時，可在原帳號那一組指定 `"password_file": "bahamut_password.txt"` 和 `"cookie_file": "cookies.json"`。相對路徑以設定檔所在資料夾為準。
+單帳號模式需明確設定 `BAHAMUT_ACCOUNT` 和 `BAHAMUT_TARGET_URL`，密碼放在 `data/bahamut_password.txt`。切換成帳號清單時，可在該組指定 `"password_file": "bahamut_password.txt"` 和 `"cookie_file": "cookies.json"`。相對路徑以設定檔所在資料夾為準。
 
 若板規要求同帳號一天只在其中一篇文章回覆，將需要一併檢查的文章列入該組的 `guard_urls`。單帳號模式使用 `BAHAMUT_GUARD_URLS`，以逗號分隔。
 
@@ -73,7 +73,7 @@ BAHAMUT_ACCOUNTS_FILE=data/accounts.json
 
 排程、回覆、重試和登入等完整設定都列在 [.env.example](.env.example)。
 
-需要 Discord 通知時，把 Webhook URL 放在 `data/discord_webhook.txt`，並設定 `DISCORD_ATTENTION_USER_ID` 指定失敗時要通知的帳號。可用 Console 的 `test-notification` 確認。
+需要 Discord 通知時，把 Webhook URL 放在 `data/discord_webhook.txt`。若要在失敗通知中標註使用者，可設定 `DISCORD_ATTENTION_USER_ID`。可用 Console 的 `test-notification` 確認。
 
 ## 專案結構
 

@@ -114,7 +114,7 @@ class AuthTests(BumperTestCase):
                 config = self.config(Path(directory))
                 config.cookie_file.write_text("Cookie: saved=original", encoding="utf-8")
                 forum = requests.Session()
-                mobile = self.mobile_response(200, '{"userid":"sangege01"}')
+                mobile = self.mobile_response(200, '{"userid":"bump_test"}')
                 mobile.cookies.set("BAHARUNE", "test-rune", domain=".gamer.com.tw")
                 snapshot = replace(
                     parse_thread_snapshot(
@@ -173,7 +173,7 @@ class AuthTests(BumperTestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = self.config(Path(directory))
             config.password_file.write_text("test-password", encoding="utf-8")
-            mobile = self.mobile_response(200, '{"userid":"sangege01"}')
+            mobile = self.mobile_response(200, '{"userid":"bump_test"}')
             mobile.cookies.set("BAHARUNE", "test-rune", domain=".gamer.com.tw")
             forum = requests.Session()
             page = parse_thread_snapshot(PAGE, self.url, config.account, datetime.now(self.tz))

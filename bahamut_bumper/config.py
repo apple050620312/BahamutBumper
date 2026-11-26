@@ -16,7 +16,6 @@ from .errors import ConfigurationError
 from .forum import validate_forum_url
 
 
-DEFAULT_URL = "https://forum.gamer.com.tw/C.php?bsn=18673&snA=205415"
 DOTENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 DOTENV_QUOTED_VALUE = re.compile(r"""(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?""")
 
@@ -65,7 +64,7 @@ class AccountConfig:
     guard_urls: tuple[str, ...]
     timeout_seconds: int
     discord_webhook_file: Path
-    discord_user_id: str
+    discord_user_id: str | None
     password_file: Path
     auto_mobile_login: bool
 
@@ -95,36 +94,34 @@ class AppConfig:
         except Exception as exc:
             raise ConfigurationError(f"無效時區：{timezone_name}") from exc
 
-        target_url = DEFAULT_URL
+        target_url = ""
         guards: list[str] = []
-        account = "sangege01"
+        account = ""
         if not accounts_file:
-            target_url = validate_forum_url(
-                os.getenv("BAHAMUT_TARGET_URL", DEFAULT_URL).strip()
-            )
+            account = os.getenv("BAHAMUT_ACCOUNT", "").strip()
+            raw_target = os.getenv("BAHAMUT_TARGET_URL", "").strip()
+            if not account or not raw_target:
+                raise ConfigurationError(
+                    "請設定 BAHAMUT_ACCOUNTS_FILE，或同時設定 BAHAMUT_ACCOUNT 與 BAHAMUT_TARGET_URL。"
+                )
+            target_url = validate_forum_url(raw_target)
             for value in os.getenv("BAHAMUT_GUARD_URLS", "").split(","):
                 if value.strip():
                     guard = validate_forum_url(value.strip())
                     if guard != target_url:
                         guards.append(guard)
-            account = os.getenv("BAHAMUT_ACCOUNT", account).strip()
         message = os.getenv("BAHAMUT_MESSAGE", "推").strip()
-        if not account:
-            raise ConfigurationError("BAHAMUT_ACCOUNT 不可為空白。")
         if not message:
             raise ConfigurationError("BAHAMUT_MESSAGE 不可為空白。")
-        discord_user_id = os.getenv(
-            "DISCORD_ATTENTION_USER_ID", "523114942434639873"
-        ).strip()
-        if not discord_user_id.isdigit():
+        discord_user_id = os.getenv("DISCORD_ATTENTION_USER_ID", "").strip() or None
+        if discord_user_id is not None and not discord_user_id.isdigit():
             raise ConfigurationError("DISCORD_ATTENTION_USER_ID 必須是純數字。")
-        deletable_messages = tuple(
-            dict.fromkeys(
-                item.strip()
-                for item in os.getenv("BAHAMUT_DELETE_MESSAGES", f"{message},eee").split(",")
-                if item.strip()
-            )
-        )
+        raw_deletable_messages = os.getenv("BAHAMUT_DELETE_MESSAGES")
+        if raw_deletable_messages is None:
+            deletable_messages = (message,)
+        else:
+            entries = (item.strip() for item in raw_deletable_messages.split(","))
+            deletable_messages = tuple(dict.fromkeys(item for item in entries if item))
 
         account_config = AccountConfig(
             target_url=target_url,

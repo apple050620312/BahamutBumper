@@ -44,7 +44,7 @@ class ForumTests(BumperTestCase):
         snapshot = parse_thread_snapshot(
             PAGE,
             self.url + "&last=1",
-            "sangege01",
+            "bump_test",
             datetime(2026, 8, 28, 8, 0, tzinfo=self.tz),
         )
         self.assertTrue(snapshot.owner_verified)
@@ -52,7 +52,7 @@ class ForumTests(BumperTestCase):
         self.assertEqual(snapshot.page_number, 1)
         self.assertEqual(snapshot.subboard, "18")
         self.assertEqual(len(snapshot.posts), 2)
-        self.assertEqual(snapshot.posts[1].post_id, "1113614")
+        self.assertEqual(snapshot.posts[1].post_id, "102")
         self.assertEqual(snapshot.posts[1].posted_at.second, 59)
         self.assertIn("post2.php", snapshot.form_action)
 
@@ -101,33 +101,33 @@ class ForumTests(BumperTestCase):
 
     def test_reply_owner_is_not_enough_to_prove_thread_ownership(self):
         page = PAGE.replace(
-            '{"author":"sangege01","owner":true,"isLogin":true}',
+            '{"author":"bump_test","owner":true,"isLogin":true}',
             '{"author":"someone_else","owner":false,"isLogin":true}',
         ).replace(
-            '<article>eee</article>',
-            '<article>eee</article><button class="tippy-option-menu" '
-            'data-tippy=\'{"author":"sangege01","owner":true}\'></button>',
+            '<article>推</article>',
+            '<article>推</article><button class="tippy-option-menu" '
+            'data-tippy=\'{"author":"bump_test","owner":true}\'></button>',
         )
         snapshot = parse_thread_snapshot(
-            page, self.url, "sangege01", datetime(2026, 8, 28, tzinfo=self.tz)
+            page, self.url, "bump_test", datetime(2026, 8, 28, tzinfo=self.tz)
         )
         self.assertFalse(snapshot.owner_verified)
 
     def test_delete_request_uses_fresh_dynamic_fields(self):
         snapshot = parse_thread_snapshot(
-            PAGE, self.url, "sangege01", datetime(2026, 8, 28, tzinfo=self.tz)
+            PAGE, self.url, "bump_test", datetime(2026, 8, 28, tzinfo=self.tz)
         )
         request = parse_delete_request(snapshot, snapshot.posts[1])
-        self.assertEqual(request.fields["sn"], "1113614")
-        self.assertEqual(request.fields["code"], "aa009ffd81d50c3a")
-        self.assertEqual(request.cookie_value, "5432")
+        self.assertEqual(request.fields["sn"], "102")
+        self.assertEqual(request.fields["code"], "fixture-delete-code")
+        self.assertEqual(request.cookie_value, "5678")
         self.assertIn("post2.php?", request.url)
 
     def test_delete_request_rejects_wrong_post_identity(self):
         snapshot = parse_thread_snapshot(
-            PAGE, self.url, "sangege01", datetime(2026, 8, 28, tzinfo=self.tz)
+            PAGE, self.url, "bump_test", datetime(2026, 8, 28, tzinfo=self.tz)
         )
-        wrong = Post("999", 12, "sangege01", snapshot.posts[1].posted_at, "eee")
+        wrong = Post("999", 12, "bump_test", snapshot.posts[1].posted_at, "推")
         # The parser constructs the URL for exactly the supplied post ID; the
         # later delete_post equality check is what rejects a nonexistent floor.
         self.assertEqual(parse_delete_request(snapshot, wrong).fields["sn"], "999")

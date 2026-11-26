@@ -22,12 +22,12 @@ from bahamut_bumper.cli import execute_console_command
 
 class SchedulerTests(BumperTestCase):
     def test_accounts_file_requires_unique_accounts_threads_and_cookies(self):
-        first = {"account": "sangege01", "target_url": self.url, "cookie_file": "first.json"}
+        first = {"account": "bump_test", "target_url": self.url, "cookie_file": "first.json"}
         second = {"account": "other", "target_url": self.other_url, "cookie_file": "second.json"}
         for field, value in (
-            ("account", "SANGEGE01"),
+            ("account", "BUMP_TEST"),
             ("target_url", self.url + "&page=2"),
-            ("target_url", self.url.replace("bsn=18673", "bsn=018673")),
+            ("target_url", self.url.replace("bsn=100", "bsn=0100")),
             ("target_url", self.other_url + "&snA=123456"),
             ("cookie_file", "./first.json"),
             ("cookie_file", "first.json.backup"),
@@ -48,7 +48,7 @@ class SchedulerTests(BumperTestCase):
                 root,
                 [
                     {
-                        "account": "sangege01",
+                        "account": "bump_test",
                         "target_url": self.url,
                         "cookie_file": "cookies.json",
                         "auto_mobile_login": False,
@@ -66,11 +66,11 @@ class SchedulerTests(BumperTestCase):
             now = datetime(2026, 11, 27, 20, 30, tzinfo=self.tz)
             threads = {}
             for url, account, cookie in (
-                (self.url, "sangege01", "first"),
+                (self.url, "bump_test", "first"),
                 (self.other_url, "other", "second"),
             ):
                 snapshot = parse_thread_snapshot(
-                    PAGE.replace("sangege01", account), url, account, now
+                    PAGE.replace("bump_test", account), url, account, now
                 )
                 threads[url] = (replace(snapshot, posts=snapshot.posts[:1]), cookie)
             published = []
@@ -100,7 +100,7 @@ class SchedulerTests(BumperTestCase):
             self.assertEqual(published, [self.url, self.other_url])
             self.assertEqual(
                 [(item["account"], item["target"]) for item in result["results"]],
-                [("sangege01", self.url), ("other", self.other_url)],
+                [("bump_test", self.url), ("other", self.other_url)],
             )
             self.assertEqual(
                 json.loads((root / "status.json").read_text(encoding="utf-8")), result
@@ -112,7 +112,7 @@ class SchedulerTests(BumperTestCase):
             config = self.config_from_accounts_file(
                 root,
                 [
-                    {"account": "sangege01", "target_url": self.url},
+                    {"account": "bump_test", "target_url": self.url},
                     {"account": "other", "target_url": self.other_url},
                 ],
             )
@@ -121,7 +121,7 @@ class SchedulerTests(BumperTestCase):
 
             def attempt(profile):
                 calls.append(profile.account)
-                if profile.account == "sangege01":
+                if profile.account == "bump_test":
                     raise MobileLoginUnavailable("HTTP 403", retryable=False)
                 if calls.count("other") == 1:
                     raise MobileLoginUnavailable("HTTP 503")
@@ -144,7 +144,7 @@ class SchedulerTests(BumperTestCase):
             ):
                 run_daemon(config, wait=wait, stopped=lambda: stopped)
 
-            self.assertEqual(calls, ["sangege01", "other", "other"])
+            self.assertEqual(calls, ["bump_test", "other", "other"])
             result = json.loads((root / "status.json").read_text(encoding="utf-8"))
             self.assertFalse(result["ok"])
             self.assertEqual([item["ok"] for item in result["results"]], [False, True])

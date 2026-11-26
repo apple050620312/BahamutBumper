@@ -22,12 +22,12 @@ class WorkflowTests(BumperTestCase):
             config = self.config_from_accounts_file(
                 Path(directory),
                 [
-                    {"account": "sangege01", "target_url": self.url},
+                    {"account": "bump_test", "target_url": self.url},
                     {"account": "other", "target_url": self.other_url},
                 ],
             )
             with self.assertRaisesRegex(SafetyError, "禁止使用正式自推文章"):
-                live_round_trip_test(config, self.other_url + "&page=2", account="sangege01")
+                live_round_trip_test(config, self.other_url + "&page=2", account="bump_test")
 
     def test_run_once_deletes_previous_reply_across_any_page_boundary(self):
         now = datetime.now(self.tz)
@@ -51,11 +51,11 @@ class WorkflowTests(BumperTestCase):
 
         for old_page in (2, 137):
             with self.subTest(old_page=old_page):
-                old_post = Post(str(old_page * 20), old_page * 20, "sangege01", previous, "推")
+                old_post = Post(str(old_page * 20), old_page * 20, "bump_test", previous, "推")
                 new_post = Post(
                     str(old_page * 20 + 1),
                     old_page * 20 + 1,
-                    "sangege01",
+                    "bump_test",
                     today,
                     "推",
                 )
@@ -88,16 +88,16 @@ class WorkflowTests(BumperTestCase):
 
     def test_daily_classification_excludes_op_and_non_bump_text(self):
         snapshot = parse_thread_snapshot(
-            PAGE, self.url, "sangege01", datetime(2026, 8, 28, tzinfo=self.tz)
+            PAGE, self.url, "bump_test", datetime(2026, 8, 28, tzinfo=self.tz)
         )
         today, yesterday = classify_daily_posts(
             snapshot, self.config(), datetime(2026, 8, 28, tzinfo=self.tz)
         )
         self.assertEqual(today, [])
-        self.assertEqual([post.post_id for post in yesterday], ["1113614"])
-        ordinary = PAGE.replace("<article>eee</article>", "<article>正常對話</article>")
+        self.assertEqual([post.post_id for post in yesterday], ["102"])
+        ordinary = PAGE.replace("<article>推</article>", "<article>正常對話</article>")
         ordinary_snapshot = parse_thread_snapshot(
-            ordinary, self.url, "sangege01", datetime(2026, 8, 28, tzinfo=self.tz)
+            ordinary, self.url, "bump_test", datetime(2026, 8, 28, tzinfo=self.tz)
         )
         _, ordinary_yesterday = classify_daily_posts(
             ordinary_snapshot, self.config(), datetime(2026, 8, 28, tzinfo=self.tz)
@@ -107,9 +107,9 @@ class WorkflowTests(BumperTestCase):
     def test_daily_classification_finds_bump_older_than_yesterday(self):
         old_page = PAGE.replace(
             "2026-08-27 20:24:59", "2026-08-25 20:24:59"
-        ).replace("<article>eee</article>", "<article>推</article>")
+        )
         snapshot = parse_thread_snapshot(
-            old_page, self.url, "sangege01", datetime(2026, 8, 28, tzinfo=self.tz)
+            old_page, self.url, "bump_test", datetime(2026, 8, 28, tzinfo=self.tz)
         )
 
         today, previous = classify_daily_posts(
